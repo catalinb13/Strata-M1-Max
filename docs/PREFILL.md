@@ -517,3 +517,35 @@ With that, both remaining routes are measured and neither is a kernel change: la
 offload (oMLX's +9.9% on this chip) is the only one above 5% and needs a private framework with per-model fixed-shape
 banks. The engine stands at 349 tok/s against its 470-510 floor, and the floor itself assumes the drive's writes and
 this kernel set.
+
+## Can the GPU expose more than GPUTimestamp? On an M1 Max: no - it has no counters
+
+Three independent checks, and the last one is Apple's own tool saying it:
+
+| probe | result |
+|---|---|
+| `MTLDevice.counterSets` (20 lines of Objective-C) | `set timestamp : GPUTimestamp` - and nothing else |
+| `gpudebug -s <session> -c profile run` (Xcode 27, the GPU trace profiler `metal-perf` drives) | **"error: GPU profiling requires Apple M3 / A17 Pro or later"** |
+| the GitHub efforts that read Apple GPU telemetry (macgtop's `GPU_MONITORING_RESEARCH.md`, macpulse's `GPU_TELEMETRY.md`, apple-silicon-internals, socpowerbud) | all of them go through IOKit: `AGXAccelerator.PerformanceStatistics` (Device / Renderer / Tiler Utilization %, memory, clocks) and per-client `AppUsage.accumulatedGPUTime`; none reads shader-stage counters |
+
+So the counter groups a profiler would show - limiters, bandwidth, occupancy, cache, and on M5 the neural
+accelerator - are a *hardware* feature of Apple family 9 (M3/A17 Pro) and later. On an M1 Max they do not exist, which
+is why `MTLCounterSampleBuffer` offers the timestamp set alone and why the eight attention variants could not be
+attributed to anything. The tools are installed and ready for a machine that has the counters:
+`metal-perf` v0.1.0 (github.com/computer-graphics-tools/metal-perf) wraps `gpucapture` + `gpudebug` for
+`capture`/`profile`/`counters`/`shaders` with no Xcode window, and Xcode 27.0, `gpucapture`, `gpudebug` and the Metal
+toolchain are all present on this Mac.
+
+What an M1 Max *does* give, beyond its timestamps:
+
+* **the memory roofline**, and it is lower than the datasheet: `metal-perf bandwidth` (2 GiB buffer) measures
+  **322.8 GB/s read** and **274.4 GB/s copy**. Every kernel here is far below that wall (the expert stream is 3.3 GB/s,
+  the whole chunk's traffic ~5 GB), which is the direct confirmation that these kernels are compute-bound and that the
+  92%/78% ceiling figures are about the matrix units, not the memory system.
+* **per-command-buffer GPU time** per process, from IOKit (`AGXDeviceUserClient.AppUsage`), which is what this engine's
+  own `STRATA_METAL_PROMPT_KPROF` improves on by splitting a chunk per dispatch.
+
+So the honest instrument list for this Mac is: timestamps (Metal), per-dispatch GPU time (in-engine), the memory
+roofline and interleaved A/B runs (metal-perf), and static kernel analysis (`metal-perf extract`/`lines`/`air`). There
+is no occupancy or stall telemetry to be had, and no GitHub effort supplies one - not because nobody tried, but because
+the hardware does not implement it before M3.
