@@ -46,6 +46,9 @@
 #else
 #define QBUDGET 2051
 #endif
+// Cells a threadgroup covers.  128 (17 chunks a 2051-cell budget instead of 33) measured 35% SLOWER - 0.428 against
+// 0.317 ms a row - so the hypothesis that these kernels are bound by per-threadgroup cost does not hold: halving the
+// threadgroups while doubling the work each does costs more than it saves.  KEEP IN SYNC with engine/geo.h's QCH.
 #define QCH 64
 
 // Saturating fp16 store for the direct-half K/V cache (--kv fp16).  A value outside fp16's range becomes +/-inf in

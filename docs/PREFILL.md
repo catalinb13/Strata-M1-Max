@@ -388,3 +388,21 @@ the page cache's size against the 56 GiB expert set, not the drive's speed.
 And what the attention kernel's probes say (§ above): removing the dots **or** removing the cache loads leaves it at
 1 624 ms, so it is bound by neither - its cost is per-threadgroup overhead, which is why the scalar version, the
 matmul2d version and the blocked decode all land within 10% of each other.
+
+## The attention kernel: five variants, all measured
+
+With the probes saying neither the dots nor the cache loads cost anything, the hypothesis was that these kernels are
+bound by per-threadgroup cost, so fewer and fatter threadgroups should win. They do not:
+
+| variant | attention |
+|---|---|
+| baseline (64-cell chunks, one head's dot reduced at a time) | **1 624 ms**, 0.317 ms a row |
+| 128-cell chunks (17 threadgroups a token-kv instead of 33) | 0.428 ms a row - **35% worse** |
+
+Together with the flash tie, the staged decode (10% worse) and the ILP restructure (2.5x worse), that is five
+hypotheses measured and five rejections. What the numbers say is narrower than any of them: the kernel is 27 µs a
+threadgroup for work that should be 2-4 µs, the two probes remove the only candidates that are *inside* the
+threadgroup, and the per-threadgroup stages that remain (the initial Q loads from an fp32 buffer, the 12-head softmax,
+the 12 KB partials write) are each only a few KB. The honest state is that this kernel's cost is not yet explained, and
+that the next step is not another variant but a profile with `gpuStartTime`/`gpuEndTime` per dispatch and a
+counter-based look at a single threadgroup, not a rewrite.
