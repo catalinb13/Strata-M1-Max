@@ -487,3 +487,33 @@ That closes the kernel-by-kernel audit: every kernel this engine dispatches has 
 and for each one either reached it (experts 92%, GDN's large GEMMs 96-97%), or had its tile/variant/occupancy space
 swept (dense 78%, scan level with itself), or could not be moved by any of eight source-level variants with no counter
 instrument available on the GPU to go further (the attention).
+
+## Layer-first prefill, measured out of contention
+
+The one remaining route with an upstream precedent (llama.cpp PR #32082) was going to be justified by the drive
+exposure. The engine's own stream accounting bounds that exposure much more tightly than the fake-stream experiment
+suggested:
+
+```
+expert stream prompts 1 chunks: 14035 distinct lookups (292.4 per layer), in the arena 0.2802,
+  streamed ahead 0.6949, missed 0.0249; 16278 streamed in; host 449.0 ms per chunk, of it waiting 429.7 ms
+```
+
+A 5120-row chunk looks up 292 of 512 experts a layer (57%, not the "essentially all of them" the survey assumed), gets
+69% of them from the read-ahead, 28% from the arena and misses 2.5% - 350 urgent reads a chunk, ~1.2 ms each, which is
+the whole of its blocking time. Widening the read-ahead does nothing about it:
+
+| `STRATA_METAL_PREFETCH` | chunk total | chunk GPU | host waiting |
+|---|---|---|---|
+| 12 (default) | 13 764 ms | 13 177 | 130.8 ms |
+| 64 | 13 644 | 13 017 | 143.4 |
+| 512 (every expert of a layer) | 14 057 | 13 066 | 126.8 |
+
+So what layer-first could recover is 130-430 ms a chunk, i.e. 1-3%, not the 9% the earlier estimate implied - and that is
+not worth a rework of the prompt loop. (The 1.4 s that faking the stream saves is therefore not the waits: it is the
+bandwidth and cache cost of the reads themselves, which no scheduling change removes.)
+
+With that, both remaining routes are measured and neither is a kernel change: layer-first is worth 1-3%, and the ANE
+offload (oMLX's +9.9% on this chip) is the only one above 5% and needs a private framework with per-model fixed-shape
+banks. The engine stands at 349 tok/s against its 470-510 floor, and the floor itself assumes the drive's writes and
+this kernel set.
