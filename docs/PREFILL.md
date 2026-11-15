@@ -430,3 +430,18 @@ variant of this kernel but a different shape of threadgroup (a simdgroup-sized o
 Metal counter sampling to prove it before writing it. That is where this piece of the engine stops for now: the
 attention is 1.85 s of a 13.0 s chunk, every cheaper variant has been measured and rejected, and the remaining work is
 a kernel of a different granularity, not a tuning of this one.
+
+## The end of what probing can say about the attention
+
+The cross-lane reduction was the last stage that had a mechanism behind it: 3 840 `simdgroup` reductions a
+threadgroup, sixty a cell, at a handful of cycles each is the right order for its bulk. Mapping a head onto **eight
+lanes instead of thirty-two** (a lane holds 32 dims, the dot reduces in three shuffle steps instead of five) measures
+**1 659 against 1 624 ms** - neutral, the registers it adds paying for the shuffles it saves.
+
+With that, every stage of the kernel has been removed in turn and every one measures free: the dots, the K loads, the V
+loads, the partials store, the softmax's exp, the cross-lane reduction, the threadgroup footprint (fp16 Q: neutral) and
+the threadgroup granularity (128 cells: 35% worse; the matmul2d version: a tie). Nothing inside the threadgroup costs
+anything, and nothing inside it can be made cheaper. That is not a tuning result, it is a statement that the kernel's
+27 us a threadgroup is spent somewhere no source-level change reaches - which leaves Metal counter sampling
+(`MTLCounterSampleBuffer`, per-threadgroup occupancy and stall counters) as the only way to find it, and no further
+variants worth writing blind.

@@ -453,6 +453,10 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
     if (tid < QCH) cid[tid] = tid < nc ? ids[t * QBUDGET + c0 + tid] : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // scores: 12 x 64 dots of 256; simdgroup sg takes cells sg, sg + 8, ...; lanes split the 256 dims (8 each)
+    // One head at a time, its dot reduced before the next begins.  Every stage of this loop has now been probed away
+    // in turn - the dots, the K loads, the V loads, the store, the softmax's exp, the cross-lane reduction itself
+    // (eight lanes a head, three shuffles instead of five: 1659 against 1624 ms) - and each measures free.  The
+    // kernel's 27 us a threadgroup is therefore not in its code: see PREFILL.md.
     for (int c = sg; c < nc; c += 8) {
         const uint rowi = uint(cid[c]) * QKV + uint(g);
         device const char* kr = kq + rowi * QD;
