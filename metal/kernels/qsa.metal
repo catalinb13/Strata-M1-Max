@@ -85,6 +85,10 @@ constant bool qsa_rows = is_function_constant_defined(QSA_ROWS_C) && QSA_ROWS_C;
 // QSA_MROPE too, buffer 20 holds every slot's table and row t reads its own at offset M-RoPE (ints).  Off: exactly the
 // plain kernels.
 
+// A bench probe (function constant 5): 1 = the attention's scores without the dots, 2 = without the cache loads.
+constant int QSA_PROBE [[function_constant(5)]];
+constant int qsa_probe = is_function_constant_defined(QSA_PROBE) ? QSA_PROBE : 0;
+
 struct QsaArgs {
     uint pos0;        // the window's first cell (relative to the sequence)
     uint pos_base;    // absolute position of cell 0 (RoPE)
@@ -452,7 +456,9 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
         for (int i = 0; i < 8; ++i) kv[i] = float(kr[lane * 8 + i]) * scl;
         for (int h = 0; h < HPG; ++h) {
             float d = 0.0f;
-            for (int i = 0; i < 8; ++i) d = fma(qs[h][lane * 8 + i], kv[i], d);
+            if (qsa_probe != 1)   // bench probe 1: no dots, the reduction alone (wrong values)
+                for (int i = 0; i < 8; ++i) d = fma(qs[h][lane * 8 + i], kv[i], d);
+            else d = kv[0] + kv[4];
             d = simd_sum(d);
             if (lane == 0) s[h][c] = d * 0.0625f;
         }
@@ -523,8 +529,15 @@ kernel void qsa_attn_fp16(device const float* qcur [[buffer(0)]], device const h
         // kq is half*: pointer arithmetic is in ELEMENTS (2 B each).  This lane reads the row's dims lane*8 .. +7,
         // so the base is `off` elements and the second half4 sits 4 elements (not 8) after it.
         const int off = int(rowi) * QD + lane * 8;
-        const half4 k0 = *(device const half4*)(kq + off);
-        const half4 k1 = *(device const half4*)(kq + off + 4);
+        half4 k0, k1;
+        if (qsa_probe == 2) {   // bench probe: no cache read (wrong values)
+            const uint zz = uint(cid[c]) + uint(lane);
+            k0 = half4(half(zz & 1), half(zz & 2), half(zz & 3), half(zz & 4));
+            k1 = k0;
+        } else {
+            k0 = *(device const half4*)(kq + off);
+            k1 = *(device const half4*)(kq + off + 4);
+        }
         const float kv[8] = {float(k0.x), float(k0.y), float(k0.z), float(k0.w),
                              float(k1.x), float(k1.y), float(k1.z), float(k1.w)};
         // One head at a time, its dot reduced before the next begins.  Holding all twelve accumulators live and

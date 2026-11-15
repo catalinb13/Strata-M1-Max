@@ -362,3 +362,29 @@ the only lever left in this engine, worth ~1 s of a 13.4 s chunk, and it is a re
 
 Unchanged and re-verified after each rejection: a 5120-row chunk runs in **12 983-13 564 ms** of GPU time and the greedy
 answer is the same `output : 5513` every time.
+
+## An outside survey, checked against these numbers
+
+A research pass (llama.cpp issues/PRs, flash-moe's I/O study, MoE-Infinity, SSD-LLaMA, oMLX's ANE work) ranked its
+candidates on the premise that *compute is hidden behind the drive*, so its top three all cut bytes: layer-first
+prefill, a threaded `pread`+`F_NOCACHE` read path, and an expert-contiguous pack. This engine's own measurements put
+the premise itself in question, and each item lands differently:
+
+| the survey's item | what this engine measures |
+|---|---|
+| "you are I/O bound: 60 GB a chunk at 5.3 GB/s" | the opposite: a 5120-row chunk is 13.4 s of GPU (kernels sum to 10.6 s) and needs ~45 GB of reads, i.e. **3.3 GB/s** - half the drive's 6.4 GB/s. Faking the stream (`STRATA_METAL_STREAM_FAKE=1`) saves only 1.4 s of the 13.4 |
+| threaded `pread` + `F_NOCACHE`, no madvise hints | already the path: `F_NOCACHE`, 6 I/O threads, 6.4-6.8 GB/s measured, and `STRATA_METAL_PREFETCH` 6/12/24 makes no difference |
+| expert-contiguous, 2 MB-aligned pack | already the pack: each expert's gate/up/down is one 2,380,800-byte block, read with one request |
+| layer-first prefill (one expert sweep per *prompt*; llama.cpp PR #32082) | real, but bounded here: it can only recover the *exposed* I/O, ~1.4 s a chunk (the plan already reads 45 GB a chunk from a 56 GiB set, 26% of it resident). It also makes each expert's slab be re-read by more rows, which is the mpp path's own metric. Worth ~9% on a 3-chunk prompt for a rework of the whole prompt loop |
+| dequantise in-kernel, never materialise fp16 experts | measured: the slab's GEMMs are at 92% of the ceiling and the decode is 234 ms of the chunk (the v7 work above) |
+| ANE offload of the MLP (+9.9% on an M1 Max, oMLX) | the largest measured item on this exact chip, and the only one that would move prefill without touching a kernel - but it needs the private `AppleNeuralEngine.framework`, per-model fixed-shape banks and a 4 GiB window |
+| SwiGLU fusion, split-K (+1.2-5.9% upstream) | consistent with what is left in the dense half's 22% |
+
+Also checked and not a lever: the prefill planner's drive model. It prints "drive 1.50 GB/s (assumed)" because its
+rotational-disk probe does not recognize this volume, but feeding it the real 6.4 GB/s (`STRATA_SSD_GBPS=6.4`) leaves
+the plan identical (chunk 5120, ring 96) and the loop within noise (39 060 against 39 613 ms): what binds the plan is
+the page cache's size against the 56 GiB expert set, not the drive's speed.
+
+And what the attention kernel's probes say (§ above): removing the dots **or** removing the cache loads leaves it at
+1 624 ms, so it is bound by neither - its cost is per-threadgroup overhead, which is why the scalar version, the
+matmul2d version and the blocked decode all land within 10% of each other.

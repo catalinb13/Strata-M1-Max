@@ -4659,7 +4659,14 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
                     const int ns = std::min(p.QS, T - t0);
                     QsaArgs as{(uint32_t) (pos0 + t0), 0, (uint32_t) max_cells_, (uint32_t) ns, eps_};
                     if (kv_f16_) {
-                        D(PP(p.lqsa, "qsa_attn_fp16"), {mtl::Arg::B(p.qcur, (size_t) t0 * G_QOUT * 4),
+                        // STRATA_METAL_PROMPT_QSA_PROBE=1|2: the scores without the dots / without the cache loads
+                        static const int qprobe = [] {
+                            const char* e = std::getenv("STRATA_METAL_PROMPT_QSA_PROBE");
+                            return e && *e ? std::atoi(e) : 0;
+                        }();
+                        const std::string qpn = "qsa_attn_fp16" + (qprobe ? "#p" + std::to_string(qprobe) : "");
+                        D(PP(p.lqsa, "qsa_attn_fp16", mtl::Constants().i(5, qprobe), qpn),
+                          {mtl::Arg::B(p.qcur, (size_t) t0 * G_QOUT * 4),
                                                        mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
                                                        mtl::Arg::B(p.qids, (size_t) t0 * G_BUD * 4), mtl::Arg::B(p.part), mtl::Arg::V(as)},
                           G_QCHUNKS, G_QKV, 256, (uint32_t) ns);
