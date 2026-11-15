@@ -527,6 +527,9 @@ kernel void qsa_attn_fp16(device const float* qcur [[buffer(0)]], device const h
         const half4 k1 = *(device const half4*)(kq + off + 4);
         const float kv[8] = {float(k0.x), float(k0.y), float(k0.z), float(k0.w),
                              float(k1.x), float(k1.y), float(k1.z), float(k1.w)};
+        // One head at a time, its dot reduced before the next begins.  Holding all twelve accumulators live and
+        // reducing them after the dots measured 2.5x SLOWER (4036 against 1624 ms of a chunk's attention): the twelve
+        // plus the PV accumulators spill.
         for (int h = 0; h < HPG; ++h) {
             float d = 0.0f;
             for (int i = 0; i < 8; ++i) d = fma(qs[h][lane * 8 + i], kv[i], d);

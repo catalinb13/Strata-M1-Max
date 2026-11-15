@@ -347,3 +347,18 @@ layer) and widen the cell chunk to 256 (the split-K partials are 817 KB a token,
 them back). Both move the partials layout with them. On a tensor-core kernel at 60% of the ceiling that would be ~0.6 s
 instead of 1.85 s, i.e. 423 tok/s instead of 349; the floor of 470-510 also needs the dense half's remaining 22% and
 the ~1.4 s a chunk that the streaming writes cost.
+
+## A third attention variant, and the conclusion
+
+| change | attention, 5120-row chunk |
+|---|---|
+| the twelve heads' dots computed before any is reduced (independent chains instead of one at a time) | **4036 ms** against 1624 - 2.5x slower: the twelve accumulators plus the PV ones spill |
+
+So `qsa_attn_fp16` has been tried three ways on this GPU and each loses or ties: the matmul2d flash kernel (39514 against
+39613 ms of prompt loop), the flash kernel with its K block staged coalesced (43650 ms), and the ILP restructure above.
+Its cost is the per-cell reduction chain, 43 cycles a head, and it is at the local optimum of its structure. The
+decomposition (16 tokens a tile, 256-cell chunks, tensor cores, partials layout and `qsa_merge` moving with them) is
+the only lever left in this engine, worth ~1 s of a 13.4 s chunk, and it is a rewrite rather than a change.
+
+Unchanged and re-verified after each rejection: a 5120-row chunk runs in **12 983-13 564 ms** of GPU time and the greedy
+answer is the same `output : 5513` every time.
