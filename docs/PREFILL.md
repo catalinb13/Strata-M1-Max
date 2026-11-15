@@ -445,3 +445,23 @@ anything, and nothing inside it can be made cheaper. That is not a tuning result
 27 us a threadgroup is spent somewhere no source-level change reaches - which leaves Metal counter sampling
 (`MTLCounterSampleBuffer`, per-threadgroup occupancy and stall counters) as the only way to find it, and no further
 variants worth writing blind.
+
+## The instrument that would have closed it does not exist on this Mac
+
+The next step for the attention kernel was METAL counter sampling. A three-line probe of the device settles it:
+
+```
+device: Apple M1 Max
+set timestamp : GPUTimestamp          # and nothing else
+```
+
+`MTLDevice.counterSets` on this machine offers the timestamp set alone - no stage utilization, no occupancy, no stall
+counters (those arrive with later GPU generations). So the one measurement that could say where `qsa_attn_fp16`'s 27 us
+a threadgroup goes is not available here, and neither is any other counter-based analysis of the eight variants that
+were measured. The kernel stays as measured: 1 624 ms for a 5120-row chunk, every stage of it free when removed, and
+that is the end of what this hardware allows anyone to learn about it without writing a new kernel of a different
+granularity on speculation.
+
+That also fixes the shape of the remaining work honestly: the gap between 349 tok/s and the 470-510 tok/s floor is
+*not* reachable by tuning kernels on an M1 Max. It needs either the ANE offload (a private framework, per-model
+fixed-shape banks) or layer-first prefill (a rework of the prompt loop), and both are subsystems rather than kernels.
