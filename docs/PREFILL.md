@@ -245,3 +245,65 @@ once and then served from L2, and A (M x K = 26 MB) becomes the operand that rep
 L2-served already, so what the projections are short of is MMA issue and accumulator occupancy, not the drive. Taller
 tiles make that worse, which is the same lesson as the fp16-accumulate probe: on this GPU the dense half's remaining
 third is scheduling, not bandwidth.
+
+## The per-kernel table of a chunk (STRATA_METAL_PROMPT_KPROF), and what it changes
+
+`STRATA_METAL_PROMPT_KPROF=<path>` replays a chunk's dispatch list one dispatch at a time after it has run and writes
+each kernel's GPU time (launch overhead included, so read it as a ranking; the answers afterwards are wrong). For a
+5120-row chunk on the M1 Max, the production config (mpp TM 32, the swapped dense order):
+
+| ms | n | kernel | efficiency |
+|---|---|---|---|
+| 1 866 | 384 | `mm_gu_mpp_32_128_4` (expert gate/up) | **8.8 TFLOP/s with the down GEMM = 92% of the matrix ceiling** |
+| 1 624 | 228 | `qsa_attn_fp16` (sparse attention) | 1.9 TFLOP/s - **20%**, scalar FMAs, no matrix units |
+| 1 071 | 37 | `gemm_f16_sw` g80x160 (GDN's q\|k\|v, N 10 240) | 9.3 TFLOP/s - 97% |
+| 952 | 97 | `gemm_f16_sw` g80x40 (N 2 560: hc/o projections) | 7.5 |
+| 891 | 384 | `mm_dn_mpp_32_64_2` (expert down) | (with the gate/up above) |
+| 630 | 36 | `gemm_f16_sw` g80x96 (GDN's y/z output, N 6 144) | 9.2 - 96% |
+| 602 | 96 | `gemm_f16_sw` g80x6 (N 384: beta/alpha/gate) | **1.6 - small-N waste** |
+| 581 | 36 | `gdn_scan_v` (the recurrent scan) | - |
+| 448 | 96 | `gemm_hc_up` | - |
+| 412 | 12 | `gemm_f16_sw` g80x192 (QSA's q+gate, N 12 288) | 8.9 |
+| 234 | - | `mm_expand_*` (the fp16 slab decode) | 2.4% of the chunk |
+| 206 | - | `mm_gather`, `mm_combine`, plan | 2% |
+| 213 | - | norms, epilogues, `dq_f16`, `act_f16` | 2% |
+| 2 016 | 240 | `qsa_*` altogether | 32% of the chunk's ceiling |
+| **10 626** | 4 271 | **sum of single-dispatch times** | the chunk as one command buffer: **13 439** |
+
+Three findings, and they invert the earlier ranking:
+
+1. **The expert GEMMs are done.** 24.2 TFLOP of gate/up/down in 2.757 s is 8.8 TFLOP/s, 92% of what `mm_bench`
+   measures `matmul2d` can do at all. There is nothing left there - which is the answer to the slab-vs-fused question
+   from both sides: the slab path's GEMMs are already at the hardware's limit, so only the decode could ever be
+   attacked, and it is 234 ms of the chunk.
+2. **The dense half is at 78%**, not the 66% the class split suggested: 30.2 TFLOP in 4 046 ms. The GDN's two large
+   projections are at 96-97% - they are the best-shaped GEMMs in the model (M 5120 x N 10 240 / 6 144 x K 2 560). What
+   is left of the dense side is the *small* projections (N 384 at 1.6 TFLOP/s) and the 64x64 tile's own overhead.
+3. **Sparse attention is the one large kernel that is not on the matrix units.** 2.0 s of a 13.4 s chunk at 20% of the
+   ceiling, in scalar FMA dots: per cell, 12 query heads each do a 256-term dot through `simd_sum` on the ALU.
+   `qsa_flash_fp16` - the matmul2d version - already carries a non-COOP_K4 decode branch, so
+   `STRATA_METAL_PROMPT_QSA=flash` runs on an M1; measured on a 12287-token prompt it is **no faster** (39.5 s against
+   39.6 s of prompt loop), because its non-M5 path fills the right-input cooperative tensor one element at a time and
+   that costs what the scalar dots cost. Making this phase fast needs a kernel that stages K/V tiles in threadgroup
+   memory and keeps the selection's indirection out of the inner loop: the last large piece of work in the engine.
+
+A chunk of 5120 rows is therefore 8.1 s of unavoidable matrix math (60.6 TFLOP at 9.6 TFLOP/s), 13.4 s as measured,
+and ~1.4 s of that gap is the drive's own writes (the same chunk with `STRATA_METAL_STREAM_FAKE=1` is 12.5 s). The
+practical ceiling of this engine on this Mac is therefore ~10-11 s a chunk = **470-510 tok/s**; production is at
+**349 tok/s** steady state (a 19 688-token prompt, second request in the same engine, 56.4 s) and the remaining 20%
+is the attention kernel and the small-N projections.
+
+## The first prompt after a start costs ~20 s of setup
+
+Measured on the live server: the first request of a process reports `prompt_ms 107.2 s` for 19 686 tokens while its
+engine loop is 87.3 s; the same prompt as the second request reports **56.4 s** (349 tok/s) with a 0.2 s gap. The
+19.9 s is one-time: `prompt_gemm_init` is already called after the arena fill, so it is the lazy per-kernel pipeline
+creation of the first chunk's build plus the server's first-request work, not the prompt itself. It is why the first
+prompt of a fresh server reads about half the steady-state rate, and it is worth warming (a startup pass that creates
+the chunk's pipelines, without holding the 6.2 GB prompt region, which would cost the arena ~3 000 resident experts).
+
+## Prefetch depth does not matter
+
+`STRATA_METAL_PREFETCH=6` measured 12 960 ms of chunk GPU against 12 990 at the default 12: with 51% of the experts
+resident the stream is already ahead, and the exposure is concentrated in the first chunk of a prompt (14.6 s of stall
+in the second chunk of a 19 686-token prompt, none afterwards).

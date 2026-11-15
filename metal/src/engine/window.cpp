@@ -879,6 +879,10 @@ private:
     bool m5_layout() { if (m5_layout_ < 0) m5_layout_ = coop_k4() ? 1 : 0; return m5_layout_ == 1; }
     bool pc_setup(int C);
     void pc_kprof(const std::vector<mtl::Dispatch>& ds, int nT, int64_t pos0);
+    // STRATA_METAL_PROMPT_KPROF=path (or any non-path value: stderr): after a chunk has run, replay its dispatch list one
+    // dispatch at a time and report each kernel's GPU time (the launch overhead included, so read it as a ranking) summed
+    // over the run's chunks.  The answers after the replay are wrong: measurement only.
+    void prompt_kprof(const std::vector<mtl::Dispatch>& ds, const std::vector<int>& cuts);
     // the chunk's host rows (the embedding rows and the PLE table rows): computed on a thread while the GPU runs the previous
     // chunk (STRATA_METAL_PROMPT_HOSTPIPE=0 computes them inline before each chunk)
     struct PcHost {
@@ -4286,6 +4290,40 @@ bool Window::prompt_gemm_init(std::string& err) {
     return true;
 }
 
+// The per-kernel GPU time of a prompt chunk, one dispatch at a time (see the declaration).  The streaming path's cuts
+// are honoured with the same host turn the real run makes, so each segment starts with its experts in place.
+void Window::prompt_kprof(const std::vector<mtl::Dispatch>& ds, const std::vector<int>& cuts) {
+    static std::map<std::string, std::pair<double, int>> acc;
+    static double tot = 0;
+    double sum = 0;
+    size_t gi = 0;
+    for (size_t s = 0; s <= cuts.size(); ++s) {
+        const size_t end = s < cuts.size() ? (size_t) cuts[s] : ds.size();
+        for (size_t i = gi; i < end && i < ds.size(); ++i) {
+            const mtl::Dispatch& d = ds[i];
+            std::string k = d.p->name + "  g" + std::to_string(d.grid[0]) + "x" + std::to_string(d.grid[1]) + "x" +
+                            std::to_string(d.grid[2]) + " tg" + std::to_string(d.tg[0]) + " nbuf" + std::to_string(d.args.size());
+            const double ms = cx_->run({d}, 1, false, false) * 1e3;
+            sum += ms;
+            auto& e = acc[k];
+            e.first += ms;
+            e.second += 1;
+        }
+        gi = end;
+        if (s < cuts.size()) at_cut((int) s);
+    }
+    tot += sum;
+    const char* path = std::getenv("STRATA_METAL_PROMPT_KPROF");
+    FILE* f = (path != nullptr && path[0] == '/') ? std::fopen(path, "w") : stderr;
+    if (f == nullptr) f = stderr;
+    std::vector<std::pair<double, std::string>> v;
+    for (auto& [k, x] : acc) v.emplace_back(x.first, k);
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(f, "KPROF-TABLE total %.1f ms, one dispatch at a time (launch overhead in every line)\n", tot);
+    for (auto& [t, k] : v) std::fprintf(f, "KPROF %9.1f ms %5.1f%% n=%-5d %s\n", t, 100.0 * t / std::max(1.0, tot), acc[k].second, k.c_str());
+    if (f != stderr) std::fclose(f);
+}
+
 bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err, const float* ple_pre) {
     const double chunk_t0 = now_ms();   // includes the prologue (embedding rows, the PLE gather, the dispatch build)
     in_mtp_ = false;
@@ -4903,6 +4941,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     }
     pg_ms_ += now_ms() - t0;
     pg_tok_ += T;
+    if (const char* kp = std::getenv("STRATA_METAL_PROMPT_KPROF"); kp != nullptr && *kp && T >= 1024)
+        prompt_kprof(ds, stream_ ? cuts : std::vector<int>{});
     // #879 instrument: which chunk first leaves a non-finite running state, and in which GDN layer.  The
     // checkpoint report cannot say: it samples the state at a chunk START, so it shows that the poison exists
     // but never the chunk that made it, and a poisoned state at chunk N means chunk N-1's work did it.  The
