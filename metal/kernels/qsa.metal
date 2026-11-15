@@ -431,6 +431,8 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
                      uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     constexpr int HPG = QH / QKV;   // 12 query heads per kv head
+    // fp16 here (6 KB instead of 12) measured neutral - 1641 against 1624 ms - so the threadgroup's footprint is not
+    // what limits it either; the fp32 copy is kept because it costs nothing and avoids a rounding.
     threadgroup float qs[HPG][QD];
     threadgroup float s[HPG][QCH];
     threadgroup int cid[QCH];
