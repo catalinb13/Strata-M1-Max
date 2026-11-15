@@ -12,8 +12,8 @@ its wired arena gone before the next started.
 
 | phase | ms | share | what bounds it |
 |---|---|---|---|
-| GPU: routed experts (mpp, 16-row tiles) | 6 900 | 40% | fp16 slab traffic + the expand; 0.9 TFLOP/s of useful math |
-| GPU: dense projections (GDN + QSA + hc + head) | 5 000 | 29% | the matrix units; 8.6 TFLOP/s, close to the 9.6 the GPU can do |
+| GPU: routed experts (mpp, 16-row tiles) | 6 900 | 40% | fp16 slab traffic + the expand; 0.8 TFLOP/s of useful math - 9% of the GPU's ceiling |
+| GPU: dense projections + attention (GDN, QSA, hc, head) | 5 000 | 29% | the matrix units; 6.3 TFLOP/s - 66% of the 9.6 the GPU can do |
 | GPU: QSA attention over the chunk | 1 500 | 9% | incremental |
 | PLE rows: 16 n-gram rows a token from the 61 GB table | 3 100 | 18% | 27.7k random 4 KB reads at 116 MB/s - **IOPS, not bandwidth** |
 | MTP drafter's K/V rows | 650 | 4% | one layer, run serially after the chunk |
@@ -22,13 +22,15 @@ its wired arena gone before the next started.
 
 Two facts follow from the table and they decide everything else.
 
-1. **The dense half is at the hardware's ceiling.** `mm_bench` measures Metal's `matmul2d` at
-   **9.61 TFLOP/s** for the 64x64x4 tile on a 4096^3 product, 9.45 on the prompt's qkv shape
-   (2048x4096x2560). The dense projections move 4.8 Gparams a token (9.6 GFLOP) and run at
-   8.6 TFLOP/s - 90% of that ceiling. An **fp16-accumulating** twin of the same kernel
-   (`mpp_mm_hacc_half_64_64_4`, added to `mm_bench`) measures **9.64 TFLOP/s**: on this GPU the
-   matrix units do not go faster for a lower-precision accumulator, so no free 2x is hiding there.
-2. **The routed experts are 10x off.** 4.7 TFLOP of expert math takes 5.4-6.9 s: 0.9 TFLOP/s.
+1. **The dense half is two thirds of the way to the hardware's ceiling.** `mm_bench` measures Metal's
+   `matmul2d` at **9.61 TFLOP/s** for the 64x64x4 tile on a 4096^3 product, 9.45 on the prompt's qkv
+   shape (2048x4096x2560). The dense projections move 4.8 Gparams a token (9.6 GFLOP) and the
+   matrix work plus attention takes 6.3 s of the chunk: **6.3 TFLOP/s, 66%**. An
+   **fp16-accumulating** twin of the same kernel (`mpp_mm_hacc_half_64_64_4`, added to `mm_bench`)
+   measures **9.64 TFLOP/s**: on this GPU the matrix units do not go faster for a lower-precision
+   accumulator, so the missing third is scheduling, the many small projections (router N=1, hc
+   mixes N<=64, the N=1 gate) and the elementwise epilogues - not a faster instruction.
+2. **The routed experts are ten times off.** 4.7 TFLOP of expert math takes 5.4-6.9 s: 0.8 TFLOP/s.
    They are bound by the fp16 slabs mpp materialises (194 GB written and 388 GB read a chunk at
    TM 32), not by math and not by the drive.
 
@@ -36,14 +38,47 @@ Two facts follow from the table and they decide everything else.
 
 Useful math a prompt token costs ~13 GFLOP (dense 9.6 + routed 1.15 + attention). At the GPU's
 9.6 TFLOP/s the *whole* prompt cannot run faster than 13 GFLOP / 9.6 TFLOP/s = **1.35 ms a token
-= 740 tok/s**, and that assumes the experts become as efficient as the dense half and every host
-phase vanishes. Today's 345 tok/s is 47% of that ceiling; a realistic end state (experts at ~2 s
-a chunk, host phases gone) is 600-650 tok/s.
+= 740 tok/s**, and that assumes both halves reach the ceiling and every host phase vanishes.
+Today's 345 tok/s is 47% of that ceiling. Halving the time therefore needs the experts at ~4x
+(0.8 -> 3.5 TFLOP/s: 6.9 s -> 1.6 s) **and** the dense half at the ceiling (6.3 -> 9.6 TFLOP/s:
+5 s -> 3.3 s) at the same time:
 
-So: **the 400 GB/s of DRAM is not what limits prefill on this Mac - the 9.6 TFLOP/s of matrix
-units is.** Doubling prefill means halving the *math* bill, and the only ways left are to make the
-expert path cost what it should and to stop paying full price for the parts of the dense half that
-are not matrix math.
+| | today | doubling needs |
+|---|---|---|
+| expert path | 6.9 s (0.8 TFLOP/s) | 1.6 s (3.5 TFLOP/s) |
+| dense + attention | 5.0 s (6.3 TFLOP/s) | 3.3 s (9.6 TFLOP/s) |
+| PLE gather, drafter, serve overhead | 0.65 + 3.1 + ~1.1 s | ~0 |
+| chunk of 5120 rows | 17.1 s (345 tok/s) | 8.5 s (690 tok/s) |
+
+So **the 400 GB/s of DRAM is not what limits prefill on this Mac - the 9.6 TFLOP/s of matrix units
+is**, and doubling means collecting *every* item on that list, not one big trick. The expert path
+is the only place where a single change buys more than half of it.
+
+## What other engines do about it, and which parts apply here
+
+* **llama.cpp, offloaded MoE prefill (issue #25859, PR #21067).** Their finding is exactly this
+  engine's situation: "at prefill batch sizes the selection isn't buying anything... the union of
+  experts selected across the batch is essentially all of them", so they skip the routing readback
+  and stream each layer's whole expert set on a second stream, and they page-lock the offloaded
+  weights so the copies DMA instead of bouncing through a pageable buffer. Measured +64% prefill
+  (1143 -> 1880 tok/s at pp2048) on a 3060. Our engine already does both halves of that idea
+  (`at_layer` streams all of layer l+1 behind layer l's compute; the arena is `mlock`ed), which is
+  why the expert deficit (29 GB a chunk) costs nothing. What they do *not* do and we do is
+  materialise the expert in fp16 first: llama.cpp's MMQ kernels dequantize inside the dot product,
+  so their expert pass pays the quantized bytes once and no slab. That is item 1 below.
+* **The drive queue.** Random uncached reads on this machine's SSD, measured at expert size:
+  2.4 MB at queue depth 1 = 2.6 GB/s, QD4 = 5.4, QD8 = 5.6, QD16 = 8.7. The arena fill already
+  runs at 6.5-6.8 GB/s with 6 threads, and 12 and 24 threads measured no better, so the stream is
+  at the top of its curve and raising it is not a lever.
+* **Bigger prompts per pass** (the ZINC write-up's and llama.cpp's `-ub`/`-b` sweeps both report
+  chunk size as the biggest single knob for prefill). Here it is not: from 4096 to 8192 rows the
+  per-row GPU time goes from 2.57 to 2.76 ms (the prompt buffers grow and the arena yields slots,
+  so the extra rows buy nothing). The chunk-size win exists only while a prompt is drive-bound, and
+  this one is not (96.6% GPU busy).
+* **Precision tricks** (fp8/int8 matmul, fp16 accumulate). No int8/FP8 matrix path exists on an M1
+  GPU, and fp16 accumulation measures the same 9.6 TFLOP/s as fp32 (see above), so this family is
+  closed on this hardware.
+
 
 ## What changed here (measured)
 
