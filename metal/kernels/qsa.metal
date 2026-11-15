@@ -516,6 +516,8 @@ kernel void qsa_attn_fp16(device const float* qcur [[buffer(0)]], device const h
     for (int h = 0; h < HPG; ++h) qs[h][tid] = qcur[(t * QH + g * HPG + h) * QD + tid];
     if (tid < QCH) cid[tid] = tid < nc ? ids[t * QBUDGET + c0 + tid] : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // One cell a pass.  Four cells' rows loaded together measured 7% SLOWER (1734 against 1624 ms of a 5120-row
+    // chunk's attention): what a cell costs is the twelve simdgroup reductions that follow its read, not the read.
     for (int c = sg; c < nc; c += 8) {
         const uint rowi = uint(cid[c]) * QKV + uint(g);
         // kq is half*: pointer arithmetic is in ELEMENTS (2 B each).  This lane reads the row's dims lane*8 .. +7,

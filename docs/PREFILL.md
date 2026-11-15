@@ -330,3 +330,20 @@ What is left for this kernel is a decomposition change, not a tuning one: the cu
 split-K partials buffer (817 KB a token, 4.2 GB a layer, which `qsa_merge` then reads back). Blocking 16 tokens into
 one tile would divide the first by 16, and a 256-cell chunk would divide the second by 4 - both need the partials
 layout and `qsa_merge` to change with them.
+
+## Two more measured and rejected (so they are not tried again)
+
+Both target the largest and the worst-shaped kernels of the table above; both lose, and for the same reason - what
+looks like a memory stall is really the arithmetic that follows it.
+
+| change | 5120-row chunk |
+|---|---|
+| `qsa_attn_fp16`: its four cells' rows loaded together, so one row's L2 latency overlaps the others' | attention `1624 -> 1734 ms` (7% slower): a cell costs the twelve `simdgroup` reductions after its read, not the read |
+| `gemm_f16_sw` at half height (tm 32) for a narrow output - N 384 is six N tiles, 480 threadgroups at 1.6 TFLOP/s | N 384 `602 -> 672 ms`, N 512 `140 -> 181 ms`: not an occupancy problem either |
+
+What is left for sparse attention is a decomposition, not a tuning: block the 16 tokens a tile (the current tile is
+one token x 12 heads x 64 cells, so every token re-reads the same 2051 selected rows - 2 MB a threadgroup, 20 GB a
+layer) and widen the cell chunk to 256 (the split-K partials are 817 KB a token, 4.2 GB a layer, and `qsa_merge` reads
+them back). Both move the partials layout with them. On a tensor-core kernel at 60% of the ceiling that would be ~0.6 s
+instead of 1.85 s, i.e. 423 tok/s instead of 349; the floor of 470-510 also needs the dense half's remaining 22% and
+the ~1.4 s a chunk that the streaming writes cost.

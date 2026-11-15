@@ -4403,6 +4403,9 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         }();
         const int sg = std::atoi(tile.c_str() + tile.rfind('_') + 1);
         const int tm = std::atoi(tile.c_str());
+        // Half-height tiles for a narrow output (N 384 and under) measured SLOWER - 672 against 602 ms of a chunk, and
+        // 181 against 140 at N 512 - so the same tile serves every shape: what a 64x64 tile of six N tiles lacks is not
+        // occupancy but the MMA's own setup at every K step.
         const int tn = Nn <= 64 ? 32 : std::atoi(tile.c_str() + tile.find('_') + 1);
         // block order (STRATA_METAL_PROMPT_GEMM_ORDER=sw): M on the grid's x, N on its y, so the blocks in flight
         // share one N column block and its B slice stays in L2 instead of the whole B being walked per row tile
