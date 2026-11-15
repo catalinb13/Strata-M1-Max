@@ -776,6 +776,8 @@ CALL_END = "</tool_call>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
+# a complete `<function=NAME>`: what "unfinished_call_text": "drop" looks for before it keeps a block as text
+_FUNC_NAMED = re.compile(r"<function=\s*[^<>\s]+\s*>")
 # #3441: the opener a model writes when it drifts by a token inside the envelope the template documents:
 # `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
 _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
@@ -1243,6 +1245,14 @@ class OutputParser:
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
+        # opt-in (the config's "unfinished_call_text": "drop"): a turn that ends inside a call the model opened but never
+        # wrote a `<function=NAME>` for (a body that is not the template's form, or a tail of one) shows no call markup in
+        # the reply (the answer's text and the reasoning, which a client may display); what was dropped goes to
+        # `dropped_unfinished` for the server to log.  Off: the text, as since 0.2.2.
+        self.drop_unfinished_call_text = False
+        self.dropped_unfinished = ""   # the text drop_unfinished_call_text kept out of the reply
+        self.dropped_unfinished_blocks = 0   # how many `<tool_call>` blocks that text was
+        self._swallow = False          # "unfinished_call_text": "drop": inside a `<tool_call>` block that never named a function
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
@@ -1253,7 +1263,18 @@ class OutputParser:
     def clean(self) -> bool:
         """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text, as
         serve/dsml.py's does, also counts what it holds)."""
-        return not self.buf and not self._held
+        return not self.buf and not self._held and not self._swallow
+
+    def _hold_back(self, raw: str) -> bool:
+        """`unfinished_call_text: drop`: keep `raw` - a `<tool_call>` block (or its tail) with no complete
+        `<function=NAME>` - out of the reply and record it for the server's log.  False when the option is off or the
+        block names a function (an undeclared name is "undeclared_tool_calls"' business, not this option's)."""
+        if not (self.drop_unfinished_call_text and raw.lstrip().startswith(CALL_START)
+                and not _FUNC_NAMED.search(raw)):
+            return False
+        self.dropped_unfinished += raw
+        self.dropped_unfinished_blocks += 1
+        return True
 
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
@@ -1725,13 +1746,15 @@ class OutputParser:
                     raw = self.buf[:len(CALL_START) + end + drop]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
-                    else:
+                    elif not self._hold_back(raw):          # "unfinished_call_text": "drop" holds a nameless block back
                         out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + drop:]
                     self.state = "reasoning"
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
                     out += self._release(False)
-                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
+                    raw = self.buf[:len(CALL_START) + think]
+                    if not self._hold_back(raw):            # the same option, for the block a `</think>` cut short
+                        out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[think:]
                     self.state = "reasoning"
                 elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding the thinking back
@@ -1801,6 +1824,21 @@ class OutputParser:
                         return out
                     self.buf, self.lead = stripped, False
                 i = self.buf.find(CALL_START)
+                if self._swallow:
+                    # "unfinished_call_text": "drop": a `<tool_call>` whose follower was never a call.  Its block is not
+                    # the answer's text; the next real call opener (or the end of the turn) ends what is held back.
+                    end, nxt = self.buf.find(CALL_END), self.buf.find(CALL_START, 1)
+                    if nxt >= 0 and (end < 0 or nxt < end):
+                        self.dropped_unfinished += self.buf[:nxt]
+                        self.dropped_unfinished_blocks += 1
+                        self.buf, self._swallow = self.buf[nxt:], False
+                        continue
+                    if end < 0:
+                        return out                               # nothing of it goes out: the block goes on (or the turn ends)
+                    self.dropped_unfinished += self.buf[:end + len(CALL_END)]
+                    self.dropped_unfinished_blocks += 1
+                    self.buf, self._swallow = self.buf[end + len(CALL_END):], False
+                    continue
                 stray = self._stray_think_at() if self.after_think else -1
                 if stray >= 0 and (i < 0 or stray < i):
                     # #4077: the reasoning ended at a `</think>` the model wrote while thinking (quoting the format on a
@@ -1897,6 +1935,14 @@ class OutputParser:
                         is_call = None     # only declared names gain whitespace normalization
                 is_partial = FUNC_START.startswith(after) or re.fullmatch(r"<function=\s*[^<>\s]*\s*", after)
                 if not is_call and not is_partial:
+                    if self.drop_unfinished_call_text and self._ok_at(i):
+                        # a call opens here and what follows is not one (a name that is not `<function=NAME>`, a tail
+                        # of one): with "unfinished_call_text": "drop" the block is held back, not shown as the answer
+                        if i and self.buf[:i].strip():
+                            out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                        self.buf = self.buf[i:]
+                        self._swallow = True
+                        continue
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
@@ -1990,7 +2036,9 @@ class OutputParser:
 
     def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211; with
+        `drop_unfinished_call_text` a call body that never had a `<function=NAME>` is held back instead of shown).
+        `reason` is
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
@@ -2043,11 +2091,19 @@ class OutputParser:
             return out
         if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
             self.buf, self.state = "", "content"
+        if self._swallow:                       # "unfinished_call_text": "drop": the block never closed
+            if self.buf:
+                self.dropped_unfinished_blocks += 1
+            self.dropped_unfinished += self.buf
+            self.buf, self._swallow = "", False
         if self.buf:
             # an unfinished call inside the reasoning (#804) is reasoning text, never a call
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = CALL_START + self.buf if self.state in ("call", "json") and not self.bare else self.buf
-            out.append(Event(kind, text))
+            # "unfinished_call_text": "drop": a call the turn ended inside whose body never named its function (on its
+            # own, or as the tail of one after a cut) is logged, not the reply's text - no client can run it.
+            if self.bare or not self._hold_back(text):
+                out.append(Event(kind, text))
             self.buf = ""
         return out
 

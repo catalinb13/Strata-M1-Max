@@ -5094,6 +5094,7 @@ class Service:
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
+        self.unfinished_call_text = "keep"                # #211: "drop" keeps a call the turn ended inside, with no `<function=NAME>`, out of the reply
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
@@ -6133,6 +6134,8 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:tool_calls_unread_total", "counter", "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:tool_calls_dropped_total", "counter", "<tool_call> blocks held back from the reply (answer and reasoning): the model wrote one that never named a function (\"unfinished_call_text\": \"drop\")",
+             t.get("tool_calls_dropped", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -6634,6 +6637,7 @@ class Service:
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
+        parser.drop_unfinished_call_text = self.unfinished_call_text == "drop"   # an attribute: the DSML parser has its own state machine
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -7148,6 +7152,13 @@ class Service:
                 self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + parser.unread
             # #3796: the same names for the client (a machine-readable marker next to the text, which stays as the model wrote it)
             rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
+        if getattr(parser, "dropped_unfinished", ""):      # "unfinished_call_text": "drop"
+            print(f"[strata] {parser.dropped_unfinished_blocks} <tool_call> block(s) the turn ended inside, with no "
+                  f"<function=NAME>, are held back from the reply, answer and reasoning (\"unfinished_call_text\": "
+                  f"\"drop\"): {parser.dropped_unfinished[:160]!r}", flush=True)
+            with self.status_lock:
+                self.totals["tool_calls_dropped"] = (self.totals.get("tool_calls_dropped", 0)
+                                                     + parser.dropped_unfinished_blocks)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -10276,6 +10287,19 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     return recovery
 
 
+def unfinished_call_text_setting(cfg: dict) -> str:
+    """The config's "unfinished_call_text": "keep" (the default, #211: the text of a call the turn ended inside is the reply's text)
+    or "drop" (no call markup in the reply - the answer's text and the reasoning - for a call the model opened and never wrote a
+    complete `<function=NAME>` for: the shapes a model drifts into, `<parameter name="x">`, `<functiontodo>`, a tail cut short;
+    what was held back goes to the log).  A call of an undeclared tool that is in the template's form is left as text either
+    way: "undeclared_tool_calls" decides that one."""
+    mode = cfg.get("unfinished_call_text", "keep")
+    if mode not in ("keep", "drop"):
+        raise SystemExit(f"[strata] config \"unfinished_call_text\" must be \"keep\" or \"drop\", not {mode!r}")
+    return mode
+
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     """Serve until stopped. For as long as it runs this server holds the shared activity lease of the runtime folder (the same one `strata serve` and
     a runtime host take), so `strata update` and a calibration run see an engine that was started by running this file directly - the desktop app's
@@ -10787,6 +10811,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
+    svc.unfinished_call_text = unfinished_call_text_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")

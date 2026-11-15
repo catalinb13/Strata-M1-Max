@@ -1440,6 +1440,59 @@ class UnfinishedToolCall(unittest.TestCase):
         self.assertEqual((a["anthropic", True][0], json.loads(a["anthropic", True][1])), ("tool_use", whole))
 
 
+class UnfinishedCallText(unittest.TestCase):
+    """`unfinished_call_text: "drop"`: a `<tool_call>` the model opened and then never named a function in is not the
+    answer's text.  Measured on this box (one agent session, 2026-11-15): 6 of 135 turns came back as such a block, 5 of
+    them with no `<function=NAME>` at all, and the client showed the raw call markup in the conversation."""
+
+    DRIFT = ["</think>\n\n<tool_call>\n<functiontodo>\n</function>\n</tool_call>",
+             '</think>\n\n<tool_call>\n<<parameter name="command">ls -la\n</parameter>\n</function>\n</tool_call>',
+             "</think>\n\n<tool_call>item>",
+             "</think>\n\n<tool_call>\n"]
+    TOOLS = [{"type": "function", "function": {"name": "write", "parameters": {
+                 "type": "object", "properties": {"path": {"type": "string"}}}}}]
+
+    def answer(self, script, drop):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        if drop:
+            svc.unfinished_call_text = "drop"
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "x", "max_tokens": 500, "tools": self.TOOLS,
+                    "messages": [{"role": "user", "content": "go"}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                choice = json.loads(r.read())["choices"][0]
+            return (choice["finish_reason"], (choice["message"].get("content") or "").strip(),
+                    choice["message"].get("tool_calls") or [])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_keep_is_the_default(self):
+        for script in self.DRIFT:
+            with self.subTest(end=script[-20:]):
+                finish, content, calls = self.answer(script, drop=False)
+                self.assertEqual((finish, calls), ("stop", []))
+                self.assertEqual(content, script.split("</think>\n\n", 1)[1].strip())
+
+    def test_drop_keeps_the_block_out_of_the_answer(self):
+        for script in self.DRIFT:
+            with self.subTest(end=script[-20:]):
+                self.assertEqual(self.answer(script, drop=True), ("stop", "", []))
+
+    def test_the_setting(self):
+        from serve.server import unfinished_call_text_setting
+        self.assertEqual(unfinished_call_text_setting({}), "keep")
+        self.assertEqual(unfinished_call_text_setting({"model": "x"}), "keep")
+        self.assertEqual(unfinished_call_text_setting({"unfinished_call_text": "drop"}), "drop")
+        for bad in ("keep ", "off", "DROP", False, 0, None):
+            with self.assertRaises(SystemExit):
+                unfinished_call_text_setting({"unfinished_call_text": bad})
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""

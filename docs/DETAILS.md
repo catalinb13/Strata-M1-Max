@@ -1301,6 +1301,18 @@ print(r.choices[0].message.content)
   returns it as a tool call instead, for a client with its own policy for unknown names: it can answer the model with the tool names
   it has and ask again, which a call kept as text never lets it do. The environment variable `STRATA_UNDECLARED_TOOL_CALLS` sets the
   same; the config wins. Only a call the parser reads as a whole call is returned; prose and quoted examples stay text (#4622).
+- **A `<tool_call>` block that never named a function (opt-in).** A turn that ends inside a call is kept as the reply's text
+  (#211), which is what a client sees when the model opens `<tool_call>` and then writes something that is not the template's
+  form - `<parameter name="command">` with XML attributes, `<functiontodo>` with the `=` lost, or the tail of a block cut in
+  two. No client can run such a block, and an agent session shows the markup either in the conversation or in the reasoning
+  it prints while the model thinks. `"unfinished_call_text": "drop"` in `strata-<model>.json` holds it back instead: the
+  block goes to the server log (`N <tool_call> block(s) the turn ended inside, with no <function=NAME>, are held back from
+  the reply, answer and reasoning`) and not to the reply - the answer's text and the reasoning both - up to the next real
+  call opener or `</tool_call>`, and `/metrics/prometheus` counts it in `strata:tool_calls_dropped_total`. On this
+  box's 0.2.13 build it took 5 of the 6 blocks one 2-hour agent session produced; the sixth named its function
+  (`<function=bash:hermes>`, an undeclared name), which `undeclared_tool_calls` decides. A block that names its function
+  is never touched, even with damaged arguments. Off by default: a reply reads exactly as it did before, and the reasoning
+  keeps the markup. A block quoted mid-sentence in prose is not affected either way (it never opens a call).
 - **Anthropic's tool search on `/v1/messages` (#4663).** A tool with `"defer_loading": true` is declared but not listed in the
   prompt; a `tool_reference` block in a `tool_result` (a tool search's result) puts that tool's definition into the prompt where it
   stands, in the form the tool list uses, so loading a tool leaves the prompt's start, and the prompt cache, unchanged. Any other

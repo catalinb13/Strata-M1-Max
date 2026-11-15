@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from serve.frontend import OutputParser  # noqa: E402
+from serve.frontend import CALL_START, OutputParser  # noqa: E402
 
 TOOLS = [{"name": "read", "parameters": {"properties": {"path": {"type": "string"}}}},
          {"name": "write", "parameters": {"properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}]
@@ -88,6 +88,90 @@ class UnclosedCall(unittest.TestCase):
         call = ("<tool_call>\n<function=write>\n<parameter=path>\nc.py\n</parameter>\n<parameter=content>\n" + value +
                 "\n</parameter>\n</function>\n</tool_call>")
         self.check(call, [("write", {"path": "c.py", "content": value})])
+
+
+# The shapes a model drifts into when its turn ends inside a call it opened (one agent session on this box, 2026-11-15: 6
+# of 135 turns).  Not one of them is the template's call form: there is no
+# `<function=NAME>` at all, so no client can run them, and the parser returns them as the answer's text (#211).
+DRIFTED = [
+    '<tool_call>\n<<parameter name="command">cd ~/x && y --help 2>&1 | tail -60\n</parameter>\n<parameter=i>\nReading help\n</parameter>\n</function>\n</tool_call>',
+    "<tool_call>\n<functiontodo>\n</function>\n</tool_call>",
+    "<tool_call>item>",
+    '<tool_call>\ned"</parameter>\n<parameter=task>\nPrune caches\n</parameter>\n</function>\n</tool_call>',
+    "<tool_call>\n",
+]
+
+
+class UnfinishedCallText(unittest.TestCase):
+    """`drop_unfinished_call_text`: off by default (the text is the answer, #211), on for these shapes the reply shows no
+    call markup - in the answer and in the reasoning, which a client displays - and the parser says what it held back."""
+
+    def events(self, text, drop, step=7, thinking=False):
+        p = OutputParser(thinking=thinking, tools=TOOLS, stream_tools=True)
+        p.drop_unfinished_call_text = drop
+        out = []
+        for i in range(0, len(text), step):
+            out += p.feed(text[i:i + step])
+        out += p.finish("stop")
+        return p, out
+
+    def reasoning(self, text, drop, tail="\n</think>\n\nDone."):
+        return self.events("<think>\n" + text + tail, drop, thinking=True)
+
+    def test_the_default_keeps_the_text(self):
+        for text in DRIFTED:
+            with self.subTest(text=text[:24]):
+                p, events = self.events(text, drop=False)
+                self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), text.strip())
+                self.assertEqual(p.dropped_unfinished, "")
+
+    def test_drop_keeps_the_markup_out_of_the_answer(self):
+        for text in DRIFTED:
+            with self.subTest(text=text[:24]):
+                p, events = self.events(text, drop=True)
+                self.assertEqual([e for e in events if e.kind == "content" and e.text.strip()], [])
+                self.assertEqual([e for e in events if e.kind == "tool_call"], [])
+                self.assertEqual(p.dropped_unfinished, text)   # the server logs it
+
+    def test_drop_keeps_the_markup_out_of_the_reasoning(self):
+        """The reasoning is what an agent session shows while the model thinks, so the same block there is the same
+        leak.  Held back whole, and the answer after `</think>` still arrives."""
+        for text in DRIFTED:
+            with self.subTest(text=text[:24]):
+                p, events = self.reasoning(text, drop=True)
+                self.assertEqual([e for e in events if e.kind == "reasoning" and CALL_START in (e.text or "")], [])
+                self.assertEqual([e for e in events if e.kind == "tool_call"], [])
+                self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), "Done.")
+                self.assertEqual(p.dropped_unfinished_blocks, 1)
+                self.assertIn(text.split("\n")[0], p.dropped_unfinished)
+
+    def test_drop_keeps_a_reasoning_block_the_think_tag_cut_short(self):
+        """The thinking ends inside the block (no `</tool_call>`): there is nothing after it to settle it, and with
+        the option on it is the same leak."""
+        p, events = self.reasoning("<tool_call>\n<functiontodo>\n</function>", drop=True)
+        self.assertEqual([e for e in events if e.kind == "reasoning" and CALL_START in (e.text or "")], [])
+        self.assertEqual(p.dropped_unfinished_blocks, 1)
+
+    def test_drop_leaves_a_call_of_the_template_form_alone(self):
+        """A body that names its function is not this option's business: a call of an undeclared tool stays text
+        ("undeclared_tool_calls" decides that one), and a whole call is still a call."""
+        drifted_name = '<tool_call>\n<function=bash:hermes>\n{"command": "x"}\n</parameter>\n</function>\n</tool_call>'
+        p, events = self.events(drifted_name, drop=True)
+        self.assertIn(drifted_name.lstrip("<tool_call>").strip(), "".join(e.text for e in events if e.kind == "content"))
+        self.assertEqual(p.dropped_unfinished, "")
+        whole = "<tool_call>\n" + READ + "\n</tool_call>"
+        p, events = self.events(whole, drop=True)
+        self.assertEqual([(e.call.name, e.call.arguments) for e in events if e.kind == "tool_call"],
+                         [("read", {"path": "a.py"})])
+        self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), "")
+        p, events = self.reasoning(whole, drop=True)     # a real call made while thinking is still a call
+        self.assertEqual([(e.call.name, e.call.arguments) for e in events if e.kind == "tool_call"],
+                         [("read", {"path": "a.py"})])
+        self.assertEqual(p.dropped_unfinished, "")
+        p, events = self.reasoning(drifted_name, drop=True)   # an undeclared name stays reasoning text
+        self.assertIn('<function=bash:hermes>', "".join(e.text for e in events if e.kind == "reasoning"))
+        self.assertEqual(p.dropped_unfinished, "")
+
 
 
 if __name__ == "__main__":
