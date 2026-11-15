@@ -431,8 +431,6 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
                      uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     constexpr int HPG = QH / QKV;   // 12 query heads per kv head
-    // fp16 here (6 KB instead of 12) measured neutral - 1641 against 1624 ms - so the threadgroup's footprint is not
-    // what limits it either; the fp32 copy is kept because it costs nothing and avoids a rounding.
     threadgroup float qs[HPG][QD];
     threadgroup float s[HPG][QCH];
     threadgroup int cid[QCH];
@@ -453,31 +451,15 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
     if (tid < QCH) cid[tid] = tid < nc ? ids[t * QBUDGET + c0 + tid] : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // scores: 12 x 64 dots of 256; simdgroup sg takes cells sg, sg + 8, ...; lanes split the 256 dims (8 each)
-    // One head at a time, its dot reduced before the next begins.  Every stage of this loop has now been probed away
-    // in turn - the dots, the K loads, the V loads, the store, the softmax's exp, the cross-lane reduction itself
-    // (eight lanes a head, three shuffles instead of five: 1659 against 1624 ms) - and each measures free.  The
-    // kernel's 27 us a threadgroup is therefore not in its code: see PREFILL.md.
     for (int c = sg; c < nc; c += 8) {
         const uint rowi = uint(cid[c]) * QKV + uint(g);
-        // kq is half*: pointer arithmetic is in ELEMENTS (2 B each).  This lane reads the row's dims lane*8 .. +7,
-        // so the base is `off` elements and the second half4 sits 4 elements (not 8) after it.
-        const int off = int(rowi) * QD + lane * 8;
-        half4 k0, k1;
-        if (qsa_probe == 2) {   // bench probe: no cache read (wrong values)
-            const uint zz = uint(cid[c]) + uint(lane);
-            k0 = half4(half(zz & 1), half(zz & 2), half(zz & 3), half(zz & 4));
-            k1 = k0;
-        } else {
-            k0 = *(device const half4*)(kq + off);
-            k1 = *(device const half4*)(kq + off + 4);
-        }
-        const float kv[8] = {float(k0.x), float(k0.y), float(k0.z), float(k0.w),
-                             float(k1.x), float(k1.y), float(k1.z), float(k1.w)};
+        device const char* kr = kq + rowi * QD;
+        float kv[8];
+        const float scl = float(ksc[rowi * 4 + (lane >> 3)]);
+        for (int i = 0; i < 8; ++i) kv[i] = float(kr[lane * 8 + i]) * scl;
         for (int h = 0; h < HPG; ++h) {
             float d = 0.0f;
-            if (qsa_probe != 1)   // bench probe 1: no dots, the reduction alone (wrong values)
-                for (int i = 0; i < 8; ++i) d = fma(qs[h][lane * 8 + i], kv[i], d);
-            else d = kv[0] + kv[4];
+            for (int i = 0; i < 8; ++i) d = fma(qs[h][lane * 8 + i], kv[i], d);
             d = simd_sum(d);
             if (lane == 0) s[h][c] = d * 0.0625f;
         }
@@ -491,7 +473,7 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
         m = simd_max(m);
         float l = 0.0f;
         for (int c = lane; c < nc; c += 32) {
-            const float p = qsa_probe == 4 ? s[h][c] : exp(s[h][c] - m);   // probe 4: no exp (wrong values)
+            const float p = exp(s[h][c] - m);
             s[h][c] = p;
             l += p;
         }
@@ -507,7 +489,6 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
         const float v = float(vq[rowi * QD + tid]) * float(vsc[rowi * 4 + (tid >> 6)]);
         for (int h = 0; h < HPG; ++h) acc[h] = fma(s[h][c], v, acc[h]);
     }
-    if (qsa_probe != 3)   // bench probe 3: no partials store (wrong values)
     for (int h = 0; h < HPG; ++h) {
         device float* o = pp + (g * HPG + h) * (QD + 2);
         o[tid] = acc[h];
