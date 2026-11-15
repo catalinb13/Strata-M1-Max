@@ -307,3 +307,26 @@ the chunk's pipelines, without holding the 6.2 GB prompt region, which would cos
 `STRATA_METAL_PREFETCH=6` measured 12 960 ms of chunk GPU against 12 990 at the default 12: with 51% of the experts
 resident the stream is already ahead, and the exposure is concentrated in the first chunk of a prompt (14.6 s of stall
 in the second chunk of a 19 686-token prompt, none afterwards).
+
+## Sparse attention: the two cheap fixes, both measured and rejected
+
+`qsa_flash_fp16` - the matmul2d version of the selected-cell attention, the one the M5 runs - carries a
+non-COOP_K4 decode branch, so `STRATA_METAL_PROMPT_QSA=flash` does run on an M1. Two attempts to make it pay:
+
+| attempt | prompt loop, 12287 tokens |
+|---|---|
+| v1 (scalar dots, the M1 default) | 39 613 ms |
+| flash, its own M1 decode | 39 514 ms |
+| flash, the K block staged coalesced in threadgroup memory | 43 650 ms |
+
+The third variant was written because the M1's right-input layout holds pairs of n at one k, so filling it one
+element at a time looks like a 128-byte line per 2-byte value - 64 KB of lines for a 32-k block's 1 KB. It is 10%
+*slower*: those lines are already reused in L1 across the lanes that need the same row, so the change only added
+instructions and two barriers a step. That also explains why flash and v1 tie - both are bound by the same thing, and
+it is not the cache.
+
+What is left for this kernel is a decomposition change, not a tuning one: the current tile is one token x 12 heads x
+64 cells, so every token re-reads the same 2051 selected rows (2 MB a threadgroup, 20 GB a layer) and writes a 33-chunk
+split-K partials buffer (817 KB a token, 4.2 GB a layer, which `qsa_merge` then reads back). Blocking 16 tokens into
+one tile would divide the first by 16, and a 256-cell chunk would divide the second by 4 - both need the partials
+layout and `qsa_merge` to change with them.

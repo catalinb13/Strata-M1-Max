@@ -427,6 +427,10 @@ kernel void qsa_flash_fp16(device const half* qh [[buffer(0)]], device const hal
                 if (s.is_valid_element(i)) s[i] = 0.0f;
             for (int k0 = d0; k0 < d0 + 64; k0 += 32) {
                 if (!coop_k4) {
+                    // Measured (2026-11-15): staging this 32-k block in threadgroup memory first, so a warp reads
+                    // one selected row's 32 halfs as 64 contiguous bytes, is 10% SLOWER (43650 against 39514 ms of
+                    // prompt loop): the per-element gather's lines are already reused in L1 across the lanes that
+                    // need the same row, so only the instructions were added.
                     for (uint16_t i = 0; i < rk.get_capacity(); ++i) {
                         const auto ix = rk.get_multidimensional_index(i);
                         const int k = k0 + ix[0], id = cid[ix[1]];
