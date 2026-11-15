@@ -133,6 +133,26 @@ the default 7 is measured +16.5% on a 12 GB card and changes the answers. `--exp
 chunk 4096 without the instruments off all measured flat or worse. Steady decode is 27-30 tok/s at 12-18K depth and
 24.7 at 111K; the process holds ~50 GB of the 64 GB box (swap steady ~2 GB, macOS and a browser share the rest).
 
+The arena is `STRATA_METAL_ARENA_GB=32` with `--leave-share` 0.35 since 2026-11-15 (38 GB with 0.55 above). The
+footprint the engine plans is the *process*, not the arena: 32.0 arena + 15.1 held before it (dense weights, K/V,
+graphs) + 0.5 for the n-gram table = 47.6 GB against a cap of 44.7 GB, so the line reads OVER THE CAP and the engine
+keeps the setting with a warning that a Mac running short of memory can freeze (watchdog panics at 90+ GB resident of
+128). Here 41.8 GB were available with 10.3 GB kept for macOS, and it stayed up through every arm below; the sub-32
+arena that would bring the process inside the cap (~29 GB) is untried.
+
+Decode is bound by the window, not by the feeder, re-measured 2026-11-15 (UD-IQ4_XS huihui, 204,800 context, `--kv
+fp16 --spec 2`, a 1.9K-token prompt and a fixed greedy decode per arm, the engine's own decode rate): prefetch depth
+6 / 12 / 20 / 32, `STRATA_METAL_IO_THREADS` 6 / 10 / 14, `STRATA_METAL_READ_SPLIT` 1 / 2 / 3 and
+`STRATA_METAL_PREFETCH_MRU` 0 / 1 all land in one band - 34.3-36.9 tok/s for the ~110-token arms, 28.6-30.7 for the
+130-token ones (deeper context, not an arm difference). The stream's numbers say why: a 62.4 ms T=2 window spends
+18.35 ms on the host and 16.94 ms of that waiting for expert reads, and the wait overlaps the GPU's work, so shortening
+it cannot shorten the window. Read-ahead quality is the other half: of 8,646 read-aheads issued, 2,483 landed in time
+and 1,767 were late (~29% useful), and the rest were dropped by `at_layer`'s rule - a predicted expert the layer did
+not choose. That drop count (59,365 in that run) is not wasted I/O; it is the router predictor being wrong.
+
+The stream summary (`expert stream ... windows: ... host ... ms per window`) is printed by `window_destroy` and
+`stream_atexit`, so a run stopped by a signal shows none of it: take those numbers from an engine that exits on its own.
+
 Where the Q4_K decode time goes on this box (`STRATA_METAL_KPROF=1`, T=1 windows, 2026-10-26): 36 ms of GPU busy
 time out of the 47-55 ms wall a token takes - the rest is read-miss stalls and the per-cut handshakes. The routed
 expert GEMMs are 30.5% of the busy time (gate/up 7.2 ms + down 4.2 ms over 47/43 layers) and run at only
@@ -143,7 +163,8 @@ the engine now picks it on M1/M2 for Q4_K/Q5_K/Q6_K gate/up; parity holds (rel L
 (4,2,4, 6% over the 4,1,4 default in the bench at 4+ tokens) is a wash live at the 1-3-token decode windows
 (21.98 against 21.51 tok/s) and stays the opt-in `STRATA_METAL_MOE_DN2=1`. Everything else on this pack
 measured flat within the +/-5% band: read-ahead depths 8/20, `PREFETCH2=6`, `IO_THREADS=4/9`, a 35 GB arena,
-the 32,2,4 gate/up tile, and `GEMV` retunes - the shipped defaults stay.
+the 32,2,4 gate/up tile, and `GEMV` retunes - the shipped defaults stay; the same knobs measured flat again on the
+UD-IQ4_XS pack (above), which is why none of them is a default change.
 
 IQ3_XXS and IQ3_S at 262K are not measured: with their 43 / 50 GB of experts, a 260K-token context brings a 64 GB PC
 to its memory limit by setup's estimate (the experts + the context's KV cache + 24 GB), so setup recommends up to 128K
