@@ -491,6 +491,7 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
         const float v = float(vq[rowi * QD + tid]) * float(vsc[rowi * 4 + (tid >> 6)]);
         for (int h = 0; h < HPG; ++h) acc[h] = fma(s[h][c], v, acc[h]);
     }
+    if (qsa_probe != 3)   // bench probe 3: no partials store (wrong values)
     for (int h = 0; h < HPG; ++h) {
         device float* o = pp + (g * HPG + h) * (QD + 2);
         o[tid] = acc[h];
@@ -571,6 +572,8 @@ kernel void qsa_attn_fp16(device const float* qcur [[buffer(0)]], device const h
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float acc[HPG];
     for (int h = 0; h < HPG; ++h) acc[h] = 0.0f;
+    // Loaded together, four cells a pass, this loop measured 8% SLOWER (1760 against 1624 ms of attention), so it
+    // stays one cell a pass like the scores above.
     for (int c = 0; c < nc; ++c) {
         const uint rowi = uint(cid[c]) * QKV + uint(g);
         const float v = float(vq[rowi * QD + tid]);   // thread = dim j: the row's half at [j]

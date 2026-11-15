@@ -406,3 +406,27 @@ threadgroup, and the per-threadgroup stages that remain (the initial Q loads fro
 the 12 KB partials write) are each only a few KB. The honest state is that this kernel's cost is not yet explained, and
 that the next step is not another variant but a profile with `gpuStartTime`/`gpuEndTime` per dispatch and a
 counter-based look at a single threadgroup, not a rewrite.
+
+## The attention kernel's probes: what is free, and what that leaves
+
+`STRATA_METAL_PROMPT_QSA_PROBE` removes one piece at a time from `qsa_attn_fp16` (wrong answers; function constant 5):
+
+| removed | attention, 5120-row chunk |
+|---|---|
+| nothing (baseline) | 1 624 ms |
+| the score dots (probe 1) | 1 638 |
+| the K cache loads (probe 2) | 1 624 |
+| the partials store (probe 3) | 1 634 |
+| the softmax's exp (probe 4) | 1 635 |
+| the V loads, four cells a pass | 1 760 (8% worse) |
+| the twelve accumulators held live | 4 036 (2.5x worse) |
+| 128-cell chunks instead of 64 | 0.428 against 0.317 ms a row |
+
+Everything inside the threadgroup is free, and *no* variant of it is cheaper. With 16 896 threadgroups a dispatch and
+7.1 ms a dispatch, the GPU is finishing one threadgroup every 420 ns and each threadgroup's code costs nothing - so
+what this kernel pays is its own granularity: 256 threads and 15.5 KB of threadgroup memory each, which fits one or two
+threadgroups per core, and nothing inside to hide the latency of the stages around them. The fix is therefore not a
+variant of this kernel but a different shape of threadgroup (a simdgroup-sized one, ~2 KB, sixteen to a core) and the
+Metal counter sampling to prove it before writing it. That is where this piece of the engine stops for now: the
+attention is 1.85 s of a 13.0 s chunk, every cheaper variant has been measured and rejected, and the remaining work is
+a kernel of a different granularity, not a tuning of this one.
