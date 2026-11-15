@@ -116,7 +116,8 @@ def start_of(p):
     if os.path.exists("/proc/self/stat"):          # Linux, and that PID has no /proc entry any more
         return None
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(p)], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=5).stdout.strip()
     except Exception:
         return None
     return None if not out else "p:" + out
@@ -171,8 +172,10 @@ def _start_token(pid: int) -> str:
             if os.path.exists("/proc/self/stat"):
                 return ""
     try:
+        # errors="replace": `ps` prints a process's argv bytes as they are, and a byte that is not UTF-8 would
+        # otherwise raise here and take the engine's start down with it (the watcher below would die silently).
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=5).stdout.strip()
+                             encoding="utf-8", errors="replace", timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
     return "" if not out else "p:" + out
