@@ -465,3 +465,25 @@ granularity on speculation.
 That also fixes the shape of the remaining work honestly: the gap between 349 tok/s and the 470-510 tok/s floor is
 *not* reachable by tuning kernels on an M1 Max. It needs either the ANE offload (a private framework, per-model
 fixed-shape banks) or layer-first prefill (a rework of the prompt loop), and both are subsystems rather than kernels.
+
+## The GDN scan's four kernels measure the same
+
+The last under-performing kernel with an available knob is the recurrent scan (581 ms, 9% of a chunk's kernels, and it
+also runs once a decode step). `STRATA_METAL_GDN_SCAN` selects its variant; on a 5120-row chunk the four measure
+
+| variant | chunk GPU |
+|---|---|
+| the chip-aware default | 13 159 ms |
+| `scanr_2` | 13 136 |
+| `scanr_4` | 13 092 |
+| `scanr_8` | 12 944 |
+
+all inside the +/-2% run-to-run spread this engine shows (12 983 - 13 564 ms over the session's runs), so there is no
+lever in the choice. The scan's cost is structural: one threadgroup barrier a token, because a state column's
+dot products reduce across the eight simdgroups that split the state's rows - which only a chunked delta-rule
+rewrite (FLA's formulation: TB tokens a barrier, the intra-block part as a 16x16 triangular matmul) removes.
+
+That closes the kernel-by-kernel audit: every kernel this engine dispatches has now been measured against the ceiling,
+and for each one either reached it (experts 92%, GDN's large GEMMs 96-97%), or had its tile/variant/occupancy space
+swept (dense 78%, scan level with itself), or could not be moved by any of eight source-level variants with no counter
+instrument available on the GPU to go further (the attention).
