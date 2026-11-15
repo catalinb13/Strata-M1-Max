@@ -4,8 +4,10 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import serve.server as server  # noqa: E402
 from serve.server import card_roles_lines, child_env, gpu_list, ordered_gpus  # noqa: E402
 
 
@@ -52,9 +54,13 @@ class Roles(unittest.TestCase):
         self.assertEqual(gpu_list(cfg), [])
         env = child_env(cfg)
         self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["HIP_VISIBLE_DEVICES"]), ("", ""))
-        with self.assertRaises(SystemExit) as e:
+        # the engine cannot start without a card on a PC; on this Mac the rule is the CPU-only line instead (a Mac
+        # engine can start without one), so this test states the PC it is about.
+        with mock.patch.object(server.sys, "platform", "linux"), self.assertRaises(SystemExit) as e:
             card_roles_lines(cfg)                                                   # a CUDA engine cannot start without a card: said plainly
         self.assertIn("Turn a card on", str(e.exception))
+        with mock.patch.object(server.sys, "platform", "darwin"):                   # the Mac's own wording, no exit
+            self.assertIn("every graphics card is Off", card_roles_lines(cfg)[0])
         cpu = card_roles_lines({**cfg, "backend": "cpu"})
         self.assertIn("Performance is degraded on CPU only.", cpu[0])
 

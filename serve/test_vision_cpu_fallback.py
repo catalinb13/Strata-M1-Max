@@ -148,7 +148,8 @@ class Fallback(unittest.TestCase):
             print("ERR cannot load the vision encoder x.gguf", flush=True)
             sys.exit(1)
         """, self.READY)
-        error, said = self.start(v)
+        with mock.patch.object(server.sys, "platform", "linux"):     # a PC's sentence: the Mac's has no card number
+            error, said = self.start(v)
         self.assertIsNone(error)
         self.assertTrue(v.on_cpu)
         self.assertIn("ERR cannot load the vision encoder", said)
@@ -160,7 +161,8 @@ class Fallback(unittest.TestCase):
             print("ERR cannot load the vision encoder x.gguf", flush=True)
             sys.exit(1)
         """, self.READY, env={"CUDA_VISIBLE_DEVICES": "3,1"})
-        self.start(v)
+        with mock.patch.object(server.sys, "platform", "linux"):
+            self.start(v)
         self.assertIn("could not start on graphics card 3. The reason", v.cpu_note)
 
     def test_on_a_mac_there_is_no_card_number(self):

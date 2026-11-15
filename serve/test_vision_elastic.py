@@ -4,6 +4,7 @@ the cache takes its VRAM back, a POST /v1/vram reserve stacks on the encoder's s
 it on its own."""
 import contextlib
 import io
+import sys
 import tempfile
 import time
 import unittest
@@ -246,10 +247,14 @@ class OnDemandByDefault(unittest.TestCase):
             "vision": {"exe": "/e/strata-vision", "mmproj": "m", "model": "t", "gpu": True, "max_tokens": 1024}}
 
     def setUp(self):
-        # these tests describe a PC (x86); the Spark class (Linux on Arm) has its own tests below, so a test run on a Spark does not change them
+        # these tests describe a PC (x86_64); the Spark class (Linux on Arm) has its own tests below, so a test run on a Spark does not change them
         p = mock.patch("platform.machine", return_value="x86_64")
         p.start()
         self.addCleanup(p.stop)
+        # and a PC rather than the Mac this suite can run on: a Mac reader was never on demand (vision_on_demand_by_default)
+        q = mock.patch.object(sys, "platform", "linux")
+        q.start()
+        self.addCleanup(q.stop)
 
     def cfg(self, **over):
         import copy
