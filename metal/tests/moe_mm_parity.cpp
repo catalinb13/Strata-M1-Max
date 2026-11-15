@@ -119,14 +119,14 @@ int main(int argc, char** argv) {
         v6_gu = "mm_gu6_" + std::to_string(gu) + "_" + tl6;
         v6_dn = "mm_down6_" + std::to_string(dn) + "_" + dtl6;
     }
-    mtl::Pipeline pgu = mpp ? cx.pipeline(lib, "mm_gu_mpp_16_128_4", probe)
+    mtl::Pipeline pgu = mpp ? cx.pipeline(lib, "mm_gu_mpp_" + std::to_string(TM) + "_128_4", probe)
                       : v6 ? cx.pipeline(lib, v6_gu, mtl::Constants().b(7, k4)) : v5 ? cx.pipeline(lib, "mm_gu5_" + std::to_string(gu) + "_" + std::to_string(TN) + "_" + std::to_string(SG),
                                          mtl::Constants().b(7, k4))
                       : v4 ? cx.pipeline(lib, "mm_gu4_" + std::to_string(gu) + "_" + std::to_string(MS) + tl.substr(tl.find('_')),
                                          mtl::Constants().b(7, k4).i(5, std::getenv("MM_PROBE") ? std::atoi(std::getenv("MM_PROBE")) : 0))
                       : v3 ? cx.pipeline(lib, "mm_gu3_" + std::to_string(gu) + "_" + tl, mtl::Constants().b(7, k4).i(5, std::getenv("MM_PROBE") ? std::atoi(std::getenv("MM_PROBE")) : 0).b(23, std::getenv("QUANT_CTAB") != nullptr))
                            : cx.pipeline(lib, (v2 ? "mm_gu2_" : "mm_gu_") + std::to_string(gu) + "_" + tl, probe),
-                  pdn = mpp ? cx.pipeline(lib, "mm_dn_mpp_16_64_2", probe)
+                  pdn = mpp ? cx.pipeline(lib, "mm_dn_mpp_" + std::to_string(TM) + "_64_2", probe)
                        : v6 ? cx.pipeline(lib, v6_dn, mtl::Constants().b(7, k4)) : v3 ? cx.pipeline(lib, "mm_down3_" + std::to_string(dn) + "_" + dtl, mtl::Constants().b(7, k4))
                             : cx.pipeline(lib, (v2 ? "mm_down2_" : "mm_down_") + std::to_string(dn) + "_" + (v2 ? dtl : tl)),
                   pgat = cx.pipeline(lib, "mm_gather"),

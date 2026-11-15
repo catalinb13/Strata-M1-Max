@@ -728,8 +728,9 @@ private:
 public:
     bool prompt_gemm_on(int64_t n) const;
     bool prompt_gemm_init(std::string& err);
-    bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
+    bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err, const float* ple_pre = nullptr);
     int prompt_chunk_rows() const;
+    strata::core::SessionState* session_state() const { return ss_; }
     void prompt_region(bool hold) { if (stream_ && st_ && st_->ready()) st_->hold_region(hold); }
     void stream_report(FILE* f) const {
         if (!st_) return;
@@ -4165,6 +4166,19 @@ bool Window::prompt_gemm_init(std::string& err) {
     p.moe_mpp = eo && std::string(eo) == "mpp";
     if (p.moe_mpp) p.gu_v3 = p.dn_v3 = false;
     if (const char* eb = std::getenv("STRATA_METAL_PROMPT_MOE_BATCH")) p.ecap = (uint32_t) std::max(32, std::atoi(eb));
+    // mpp's row tile: a tile reads its expert's gate/up (and down) slab in full, so an expert that serves n rows
+    // pays the slab n / TM times.  A 4096-token chunk gives each expert T * topk / n_expert rows (64 here), which
+    // TM 64 reads once; TM 32 halves the old 16's traffic.  Kernels: moe_mm.metal's MMGUM_/MMDNM_ list.
+    if (p.moe_mpp) {
+        // A tile reads its expert's gate/up slab in full, so an expert pays it n / TM times for the n rows it serves
+        // in a chunk; 32 halves the reads a 16-row tile makes and measured fastest on the M1 Max (4095 rows:
+        // 12386 -> 10513 ms; 64's exact-32 KB threadgroup tile was 11203).  A chunk too short to give an expert 24
+        // rows keeps 16 (padding rows would cost more than the reads saved).
+        const char* et = std::getenv("STRATA_METAL_PROMPT_MOE_TM");
+        const int rows_per_expert = (int) ((int64_t) C * TOPK / std::max(1, (int) nexp_));
+        const int tm = (et && *et) ? std::atoi(et) : (rows_per_expert >= 24 ? 32 : 16);
+        p.TM = (tm == 32 || tm == 64) ? tm : 16;
+    }
     const char* eq = std::getenv("STRATA_METAL_PROMPT_QSA");       // v1 | flash (default: flash with the M5's layout)
     p.flash = eq ? std::string(eq) == "flash" : p.k4;
     const size_t MT = (size_t) C;
@@ -4242,14 +4256,16 @@ bool Window::prompt_gemm_init(std::string& err) {
     }
     make();
     pg_ = pg.release();
-    std::fprintf(stderr, "strata metal: prompts on the matrix units in chunks of %d (experts %s, QSA %s, matmul2d layout %s; "
-                         "%.2f GB of buffers%s)\n", C, p.gu_v3 ? "v3" : "v2", p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
+    std::fprintf(stderr, "strata metal: prompts on the matrix units in chunks of %d (experts %s%s, row tile %d, QSA %s, matmul2d layout %s; "
+                         "%.2f GB of buffers%s)\n", C, p.gu_v3 ? "v3" : "v2", p.moe_mpp ? " mpp" : "", p.TM,
+                 p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
                  need / 1e9, stream_ ? ", in the expert arena while a prompt runs" : "");
     (void) err;
     return true;
 }
 
-bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err) {
+bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err, const float* ple_pre) {
+    const double chunk_t0 = now_ms();   // includes the prologue (embedding rows, the PLE gather, the dispatch build)
     in_mtp_ = false;
     PromptGemm& p = *pg_;
     p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
@@ -4272,7 +4288,9 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
                                         return e ? std::string(e) : std::string(); }();
     auto sk = [](const char* c) { return sk_.find(c) != std::string::npos; };
     // ---- the embeddings into every stream, the PLE rows
+    double pr_emb = 0, pr_ple = 0, pr_build = 0;   // the prologue's phases (STRATA_METAL_TRACE)
     {
+        const double e0 = now_ms();
         const gguf::Tensor& te = TN("token_embd.weight");
         const size_t rb = ref::row_bytes(te.type, N);
         mrope_sync(pos0, T);
@@ -4282,18 +4300,26 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
             for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
         }
+        pr_emb = now_ms() - e0;
     }
     strata::core::SessionState& ss = *ss_;
     if (ple_on_) {
-        std::vector<uint32_t> rows((size_t) T * strata::kernels::PLE_N_HEADS);
-        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-        for (int t = 0; t < T; ++t) {
-            strata::kernels::ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows.data() + (size_t) t * strata::kernels::PLE_N_HEADS);
-            prev[0] = prev[1];
-            prev[1] = tokens[t];
+        const double pl0 = now_ms();
+        if (ple_pre != nullptr) {   // gathered on a helper thread while the previous chunk computed
+            std::memcpy(p.emb.as<float>(), ple_pre, (size_t) T * N * 4);
+        } else {
+            std::vector<uint32_t> rows((size_t) T * strata::kernels::PLE_N_HEADS);
+            int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+            for (int t = 0; t < T; ++t) {
+                strata::kernels::ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows.data() + (size_t) t * strata::kernels::PLE_N_HEADS);
+                prev[0] = prev[1];
+                prev[1] = tokens[t];
+            }
+            if (!ss.ple.table->gather_batch(rows.data(), (size_t) T, p.emb.as<float>(), err)) return false;
         }
-        if (!ss.ple.table->gather_batch(rows.data(), (size_t) T, p.emb.as<float>(), err)) return false;
+        pr_ple = now_ms() - pl0;
     }
+    const double build_t0 = now_ms();
     std::vector<mtl::Dispatch> ds;
     std::vector<int> cuts;
     nb_ = false;
@@ -4309,10 +4335,19 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         return P(lib, fn, c, "pg:" + (key.empty() ? fn : key));
     };
     auto gemm = [&](const mtl::Buffer& A, const mtl::Buffer& B, const mtl::Buffer& Y, int M, int Nn, int K) {
-        const int tm = 64, tn = Nn <= 64 ? 32 : 64;
-        const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
+        // tile "<tm>_<tn>_<sg>" (STRATA_METAL_PROMPT_GEMM_TILE): B is re-read M / tm times, so a taller tile halves
+        // the dense weight traffic of a chunk; sg is the threadgroup's simdgroups (256 threads at 8).
+        static const std::string tile = [] {
+            const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM_TILE");
+            return std::string(e && *e ? e : "64_64_4");
+        }();
+        const int sg = std::atoi(tile.c_str() + tile.rfind('_') + 1);
+        const int tm = std::atoi(tile.c_str());
+        const int tn = Nn <= 64 ? 32 : std::atoi(tile.c_str() + tile.find('_') + 1);
+        const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_" + std::to_string(sg);
         PgGemm g{M, Nn, K, 0};
-        D(PP(p.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 128);
+        D(PP(p.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn,
+          (M + tm - 1) / tm, (uint32_t) (sg * 32));
     };
     auto dqb = [&](const mtl::Buffer& src, size_t off, int type, int n_in, int n_out, const mtl::Buffer& out, size_t out_off = 0,
                    uint32_t perm = 0) {
@@ -4656,11 +4691,13 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
                 ex.args.push_back(mtl::Arg::B(p.eoff));
                 push(ds, ex);
                 mtl::Dispatch g2;
-                g2.p = PP(p.lib, "mm_gu_mpp_16_128_4", {}, "mm_gu_mpp_16_128_4" + ak);
+                const std::string gpn = "mm_gu_mpp_" + std::to_string(p.TM) + "_128_4";
+                g2.p = PP(p.lib, gpn, {}, gpn + ak);
                 g2.args = {mtl::Arg::B(p.XS), mtl::Arg::B(p.EG), mtl::Arg::B(p.HS), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
                 g2.tg[0] = 128; g2.indirect = &p.meta; g2.ind_off = 2 * 4; push(ds, g2);
                 mtl::Dispatch d2;
-                d2.p = PP(p.lib, "mm_dn_mpp_16_64_2", {}, "mm_dn_mpp_16_64_2" + ak);
+                const std::string dpn = "mm_dn_mpp_" + std::to_string(p.TM) + "_64_2";
+                d2.p = PP(p.lib, dpn, {}, dpn + ak);
                 d2.args = {mtl::Arg::B(p.HS), mtl::Arg::B(p.ED), mtl::Arg::B(p.YE), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
                 d2.tg[0] = 64; d2.indirect = &p.meta; d2.ind_off = 5 * 4; push(ds, d2);
             }
@@ -4755,6 +4792,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         }
     }
     // the last layer's write applied to R (the draft layer's K/V read the final residual rows)
+    pr_build = now_ms() - build_t0;
     {
         const gguf::Tensor& tn = TN("output_hc_norm.weight");
         GrArgs a{N, HC, LR, (uint32_t) T, 1u, eps_};
@@ -4786,13 +4824,14 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             std::fprintf(stderr, "strata metal: #879 chunk start: cleared %zu non-finite words from the running GDN state\n", sbad);
     }
     const double t0 = now_ms();
+    double chunk_gpu = 0;
     if (stream_) {
         seg_T_ = T;
         cut_ids_ = p.ids.as<int32_t>();
-        run_hand(ds, cuts);
+        chunk_gpu = run_hand(ds, cuts);
         cut_ids_ = nullptr;
     } else {
-        cx_->run_graph(ds);
+        chunk_gpu = cx_->run_graph(ds);
     }
     pg_ms_ += now_ms() - t0;
     pg_tok_ += T;
@@ -4849,7 +4888,10 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         }
     }
     static const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
-    if (trace) std::fprintf(stderr, "strata metal: prompt chunk pos %lld, %d rows: %.0f ms\n", (long long) pos0, T, now_ms() - t0);
+    if (trace) std::fprintf(stderr, "strata metal: prompt chunk pos %lld, %d rows: %.0f ms total (GPU %.0f ms, %zu dispatches; "
+                            "prologue %.0f ms = embeddings %.0f + PLE %.0f + build %.0f)\n",
+                            (long long) pos0, T, now_ms() - chunk_t0, 1000.0 * chunk_gpu, ds.size(), t0 - chunk_t0, pr_emb, pr_ple,
+                            pr_build);
     // the window's state after the chunk: the conv history turned, the PLE history and token window advanced
     hp_ = 1 - hp_;
     if (ple_on_) {
@@ -5218,16 +5260,78 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
         const int64_t mn = em ? std::atoll(em) : 64;
         if (!(e && std::string(e) == "0") && n >= mn) {
             if (!g_window->prompt_gemm_init(err)) return false;
+            const double loop_t0 = now_ms();
             const int C = g_window->prompt_chunk_rows();
             std::vector<int32_t> tk32((size_t) C);
             g_window->prompt_region(true);
             bool ok = true;
+            // The PLE rows: 16 n-gram rows a token, each a random 4 KB page of the 61 GB table, so a 5120-token
+            // chunk's gather is ~3 s of IOPS-bound reads (measured: 27.7k 4 KB reads, 116 MB/s).  The table's
+            // reader sorts and dedups the pages and runs them on its own thread, so a chunk's gather here runs on
+            // a helper thread WHILE the previous chunk computes (STRATA_METAL_PLE_PREFETCH=0: the old inline
+            // gather, serialized with the GPU).  The rows a chunk needs depend only on its tokens and the two
+            // tokens before it, so they are known before the chunk runs.
+            static const bool ple_pre = [] {
+                const char* e = std::getenv("STRATA_METAL_PLE_PREFETCH");
+                return !(e && e[0] == '0');
+            }();
+            strata::core::SessionState* ss = g_window->session_state();
+            const bool ple_batch = ple_pre && ss != nullptr && ss->ple.table;
+            std::vector<float> ple_buf;
+            if (ple_batch) ple_buf.resize((size_t) 2 * C * N);
+            auto ple_gather = [&](int64_t c, int k, float* out, std::string& e2) -> bool {
+                std::vector<uint32_t> rows((size_t) k * strata::kernels::PLE_N_HEADS);
+                int32_t prev[2];
+                if (c == 0) { prev[0] = ss->ple_prev[0]; prev[1] = ss->ple_prev[1]; }
+                else { prev[0] = (int32_t) tokens[c - 2]; prev[1] = (int32_t) tokens[c - 1]; }
+                for (int t = 0; t < k; ++t) {
+                    strata::kernels::ngram_rows((const int32_t*) tokens + c + t, prev, 1, ss->ple.consts,
+                                                rows.data() + (size_t) t * strata::kernels::PLE_N_HEADS);
+                    prev[0] = prev[1];
+                    prev[1] = (int32_t) tokens[c + t];
+                }
+                return ss->ple.table->gather_batch(rows.data(), (size_t) k, out, e2);
+            };
+            if (ple_batch) {   // the first chunk's rows before the loop; every later one during the chunk before it
+                const int k0 = (int) std::min<int64_t>(C, n);
+                if (!ple_gather(0, k0, ple_buf.data(), err)) return false;
+            }
             for (int64_t c = 0; c < n && ok; c += C) {
                 const int k = (int) std::min<int64_t>(C, n - c);
                 for (int i = 0; i < k; ++i) tk32[(size_t) i] = (int32_t) tokens[c + i];
-                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err) && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
+                const float* pre = ple_batch ? ple_buf.data() + (size_t) ((c / C) & 1) * C * N : nullptr;
+                std::thread pf;
+                std::string pf_err;
+                bool pf_ok = true;
+                double pf_ms = 0;
+                int64_t nc = c + C;
+                int nk = 0;
+                if (ple_batch && nc < n) {
+                    nk = (int) std::min<int64_t>(C, n - nc);
+                    float* dst = ple_buf.data() + (size_t) ((nc / C) & 1) * C * N;
+                    pf = std::thread([&, nc, nk, dst] {
+                        const double t = now_ms();
+                        pf_ok = ple_gather(nc, nk, dst, pf_err);
+                        pf_ms = now_ms() - t;
+                    });
+                }
+                const double oc0 = now_ms();
+                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err, pre);
+                const double oc1 = now_ms();
+                if (pf.joinable()) pf.join();
+                if (!pf_ok && ok) { err = "metal prompt: the PLE rows for the next chunk: " + pf_err; ok = false; }
+                ok = ok && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
+                if (std::getenv("STRATA_METAL_TRACE"))
+                    std::fprintf(stderr, "strata metal: prompt chunk pos %lld: chunk %.0f ms, its drafter rows %.0f ms; "
+                                 "the next chunk's PLE rows %.0f ms (inside the chunk)\n",
+                                 (long long) (pos0 + c), oc1 - oc0, now_ms() - oc1, pf_ms);
             }
+            const double r0 = now_ms();
             g_window->prompt_region(false);
+            const double r1 = now_ms();
+            if (std::getenv("STRATA_METAL_TRACE"))
+                std::fprintf(stderr, "strata metal: prompt loop %lld rows in %.0f ms (of it the region release %.0f ms); "
+                             "the chunks above; any time left over is outside this loop\n", (long long) n, r1 - loop_t0, r1 - r0);
             return ok;
         }
     }

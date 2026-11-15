@@ -75,3 +75,7 @@ template [[host_name("gemm_f16_256_64_8")]] kernel decltype(gemm_f16<256, 64, 8>
 template [[host_name("gemm_f16_64_256_8")]] kernel decltype(gemm_f16<64, 256, 8>) gemm_f16<64, 256, 8>;
 template [[host_name("gemm_f16_128_32_4")]] kernel decltype(gemm_f16<128, 32, 4>) gemm_f16<128, 32, 4>;
 template [[host_name("gemm_f16_32_128_4")]] kernel decltype(gemm_f16<32, 128, 4>) gemm_f16<32, 128, 4>;
+// 8-simdgroup tiles need their narrow-N forms for the small projections (the router's N 1, the hc mixes' N <= 64)
+template [[host_name("gemm_f16_128_32_8")]] kernel decltype(gemm_f16<128, 32, 8>) gemm_f16<128, 32, 8>;
+template [[host_name("gemm_f16_64_32_8")]] kernel decltype(gemm_f16<64, 32, 8>) gemm_f16<64, 32, 8>;
+template [[host_name("gemm_f16_256_32_8")]] kernel decltype(gemm_f16<256, 32, 8>) gemm_f16<256, 32, 8>;

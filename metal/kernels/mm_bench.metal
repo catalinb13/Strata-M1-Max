@@ -31,6 +31,25 @@ MPP(half, 32, 32, 2) MPP(half, 16, 32, 1) MPP(half, 16, 16, 1) MPP(half, 128, 48
 MPP(float, 64, 32, 4) MPP(float, 64, 64, 4) MPP(float, 128, 64, 4)
 MPP(bfloat, 64, 64, 4) MPP(bfloat, 128, 64, 4)
 
+// fp16 accumulation: the destination cooperative tensor is half, which on Apple GPUs runs the matrix units at their
+// fp16 rate instead of their fp32-accumulate rate.  Half the mantissa of the product is lost (the accumulation of
+// K terms rounds each step), so a prompt path that used it would trade accuracy for throughput; measured here only.
+template <typename T, int TM, int TN, int SG>
+kernel void mpp_mm_hacc(device T* A [[buffer(0)]], device T* B [[buffer(1)]], device half* C [[buffer(2)]],
+                        constant MmArgs& a [[buffer(3)]], uint3 tg [[threadgroup_position_in_grid]]) {
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tA(A, dextents<int32_t, 2>(a.K, a.M));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tB(B, dextents<int32_t, 2>(a.K, a.N));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(a.N, a.M));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, dynamic_length_v<int>, false, true, false);
+    matmul2d<desc, execution_simdgroups<SG>> op;
+    auto mA = tA.slice(0, int(tg.y) * TM);
+    auto mB = tB.slice(0, int(tg.x) * TN);
+    auto mC = tC.slice(int(tg.x) * TN, int(tg.y) * TM);
+    op.run(mA, mB, mC);
+}
+#define MPPH(T, M, N, S) template [[host_name("mpp_mm_hacc_" #T "_" #M "_" #N "_" #S)]] kernel decltype(mpp_mm_hacc<T, M, N, S>) mpp_mm_hacc<T, M, N, S>;
+MPPH(half, 64, 64, 4) MPPH(half, 64, 32, 4) MPPH(half, 128, 64, 4) MPPH(half, 128, 128, 4) MPPH(half, 64, 128, 4)
+
 // simdgroup_matrix: threadgroup tile 64 x 64 (4 simdgroups x 32 x 32), K in steps of 8, operands from device memory
 template <typename T>
 kernel void sg_mm(device const T* A [[buffer(0)]], device const T* B [[buffer(1)]], device float* C [[buffer(2)]],

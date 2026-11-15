@@ -525,6 +525,12 @@ MMEXP(T_IQ4_NL) MMEXP(T_Q5_1)
 MMEXP(T_Q4_K) MMEXP(T_Q5_K)   // the UD-Q4_K_XL packs' routed gate/up (Q4_K; Q5_K in layer 2) on the mpp path
 MMEXP(T_Q5_0)   // the UD-IQ4_XS pack's down experts (Q5_0 in 33 of 48 layers; a missing mm_expand_6 aborts the first prompt chunk there)
 MMGUM_(16, 128, 4) MMDNM_(16, 64, 2) MMDNM_(16, 128, 4)
+// taller token tiles: the gate/up slab is read once per TM-row tile, so TM = the tokens one expert serves in a chunk
+// (T * topk / n_expert, 64 at a 4096-token chunk) reads it once instead of four times.  TN must stay 128 (a tile
+// covers gate's 64 rows and up's 64 as one paired block: the swiglu epilogue); TM 64 x TN 128 is exactly the 32 KB
+// threadgroup memory of an M1-class GPU for `ot`.
+MMGUM_(32, 128, 4) MMGUM_(64, 128, 4)
+MMDNM_(32, 64, 2) MMDNM_(64, 64, 2) MMDNM_(32, 128, 4) MMDNM_(64, 128, 4)
 
 // ---- v3: the weights decoded straight into matmul2d's right-input cooperative tensor (single-simdgroup scope),
 // no threadgroup staging and no barriers in the K loop.  Each simdgroup owns TN output rows; a threadgroup SG * TN.

@@ -38,6 +38,11 @@ namespace strata::kernels {
 namespace {
 /// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
 bool g_ple_prefetch = true;
+/// STRATA_PLE_STATS: the gather's phases (milliseconds since an arbitrary origin).
+double now_ms_p() {
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+}
 }  // namespace
 
 void ple_prefetch_enable(bool on) { g_ple_prefetch = on; }
@@ -688,12 +693,22 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
             }
         }
         wait_prefetches();
+        const double p_t0 = now_ms_p();
         std::vector<uint8_t> raw(n * impl_->rb);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
+        const double p_t1 = now_ms_p();
         if (!impl_->reader.collect(ticket, err)) return false;
+        const double p_t2 = now_ms_p();
         for (size_t i = 0; i < n; ++i) {
             impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
             if (Impl::check_on()) impl_->check_row("gather_batch", rows[i], raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
+        }
+        if (std::getenv("STRATA_PLE_STATS")) {
+            const strata::ngram::ReaderStats& st = impl_->reader.stats();
+            std::fprintf(stderr, "strata ple: gather %zu rows: issue %.0f ms, collect %.0f ms (blocked %.0f), decode %.0f ms; "
+                                 "reads %llu, dedup %llu, cache hits %llu, %.0f MB read\n", n, p_t1 - p_t0, p_t2 - p_t1,
+                         st.wait_us / 1e3, now_ms_p() - p_t2, (unsigned long long) st.reads,
+                         (unsigned long long) st.dedup_rows, (unsigned long long) st.cache_hits, st.bytes / 1e6);
         }
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;

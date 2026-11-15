@@ -49,6 +49,12 @@ int main() {
         {"mpp_mm_half_16_16_1", 2, 16, 16, 1, true},   {"mpp_mm_half_128_48_4", 2, 128, 48, 4, true},
         {"mpp_mm_half_64_48_4", 2, 64, 48, 4, true},  {"mpp_mm_half_16_128_2", 2, 16, 128, 2, true},
         {"mpp_mm_half_16_128_4", 2, 16, 128, 4, true}};
+    // fp16 accumulation (destination half): compared with the fp32-accumulate rate of the same tile
+    const std::vector<K> ks_hacc = {{"mpp_mm_hacc_half_64_64_4", 2, 64, 64, 4, true},
+                                    {"mpp_mm_hacc_half_64_32_4", 2, 64, 32, 4, true},
+                                    {"mpp_mm_hacc_half_128_64_4", 2, 128, 64, 4, true},
+                                    {"mpp_mm_hacc_half_128_128_4", 2, 128, 128, 4, true},
+                                    {"mpp_mm_hacc_half_64_128_4", 2, 64, 128, 4, true}};
     struct Shape { const char* name; int M, N, K; };
     const std::vector<Shape> shapes = {{"square 4096^3", 4096, 4096, 4096},
                                        {"expert gu 128 tok x 1280 x 2560", 128, 1280, 2560},
@@ -63,12 +69,16 @@ int main() {
                                        {"down 48 tok x 25600 x 640", 48, 25600, 640}};
     int filled = 0;
     const char* only = std::getenv("MMB_ONLY");   // a substring of the kernel names to run
-    for (const K& k : ks) {
+    std::vector<K> all = ks;
+    all.insert(all.end(), ks_hacc.begin(), ks_hacc.end());
+    for (const K& k : all) {
         if (only && k.name.find(only) == std::string::npos) continue;
         if (filled != k.elem) { fill(k.elem); filled = k.elem; }
         mtl::Pipeline p = cx.pipeline(lib, k.name);
         // correctness on a small product (M = tm*2, N = tn*2, K = 256) against the CPU
-        {
+        if (k.name.find("_hacc_") != std::string::npos) {
+            std::printf("%-26s check skipped (half destination: the fp32 reader would misread it)\n", k.name.c_str());
+        } else {
             const int M = k.tm * 2, N = k.tn * 2, KK = 256;
             MmArgs a{M, N, KK};
             mtl::Dispatch d;
