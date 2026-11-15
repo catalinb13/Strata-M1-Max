@@ -475,7 +475,7 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
         m = simd_max(m);
         float l = 0.0f;
         for (int c = lane; c < nc; c += 32) {
-            const float p = exp(s[h][c] - m);
+            const float p = qsa_probe == 4 ? s[h][c] : exp(s[h][c] - m);   // probe 4: no exp (wrong values)
             s[h][c] = p;
             l += p;
         }
