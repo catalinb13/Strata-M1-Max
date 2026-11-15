@@ -142,14 +142,18 @@ static inline void stage_w(device const uchar* w0, uint row_bytes, int k0, threa
                            threadgroup const uint* tab, ushort tid, ushort nth) {
     constexpr int UNIT = fmt<F>::UNIT, UPC = TK / UNIT, H = UNIT / 2;
     static_assert(TK % UNIT == 0, "the K chunk must hold whole units of the format");
+    static_assert(H % 4 == 0, "the staged store below writes four values at a time (every format's UNIT is 16 or 32)");
     for (int it = tid; it < TN * UPC; it += nth) {
         const int r = it / UPC, uu = it - r * UPC;
         float wv[UNIT];
         int p0, p1;
         DW<F>::run(w0 + ulong(r) * row_bytes, k0 / UNIT + uu, k0, wv, p0, p1, tab);
-        for (int j = 0; j < H; ++j) {
-            dst[r * TK + p0 + j] = half(wv[j]);
-            dst[r * TK + p1 + j] = half(wv[H + j]);
+        // four values at a time: the conversion and the threadgroup stores are a good part of what the decode costs
+        // (UNIT is 16 or 32, p0 a multiple of UNIT and p1 = p0 + UNIT / 2, so both are 4-aligned)
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < H; j += 4) {
+            *(threadgroup half4*)(dst + r * TK + p0 + j) = half4(float4(wv[j], wv[j + 1], wv[j + 2], wv[j + 3]));
+            *(threadgroup half4*)(dst + r * TK + p1 + j) = half4(float4(wv[H + j], wv[H + j + 1], wv[H + j + 2], wv[H + j + 3]));
         }
     }
 }
@@ -1558,4 +1562,168 @@ MM6_GU1(T_Q6_K) MM6_GU1(T_Q8_0) MM6_GU1(T_IQ3_XXS) MM6_GU1(T_IQ2_S) MM6_GU1(T_IQ
 MM6_DN1(T_Q5_0) MM6_DN1(T_IQ4_NL) MM6_DN1(T_Q2_0)
 #ifdef STRATA_KQ_DOWN
 MM6_DN1(T_Q4_K) MM6_DN1(T_Q5_K) MM6_DN1(T_Q6_K) MM6_DN1(T_Q3_K) MM6_DN1(T_IQ4_XS) MM6_DN1(T_IQ3_S)
+#endif
+
+// ---- v7: v6's groups, with the decoded block staged in THREADGROUP memory .......................................
+// v3-v6 decode straight into the right input's cooperative tensor and lean on the M5's element layout (COOP_K4: runs
+// of 4 consecutive k at one n, so one fetch feeds four weights).  The M1's layout holds pairs of n at one k: a lane's
+// four values are four different rows, each with its own block header, so the same trick costs the header once per
+// value.  Staging the TK x TN block in threadgroup memory instead (as mm_gu / mm_gu2 do) does not depend on that
+// layout at all: stage_w decodes each unit once for the whole threadgroup, matmul2d reads the staged block, and the
+// only traffic is the pack's quantized bytes - nothing of the expert is ever written to device memory, which is what
+// mm_expand plus the mpp run pay (the slab write and read).  Same plan as v6 (mm_scan6's groups), same tile shapes.
+template <int F, int MS, int TN, int TK, int SG>
+kernel void mm_gu7(device const uchar* W [[buffer(0)]], device const half* XS [[buffer(1)]],
+                   device half* HS [[buffer(2)]], device const int2* tiles [[buffer(3)]], constant MmArgs& a [[buffer(4)]],
+                   device const uint* smap [[buffer(5)]], device const uchar* W1 [[buffer(6)]],
+                   device const uchar* W2 [[buffer(7)]], device const uchar* W3 [[buffer(8)]],
+                   uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                   ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int TM = 16, NTH = SG * 32, NB = SG * TN;
+    threadgroup half wg[NB * TK];
+    threadgroup half wu[NB * TK];
+    threadgroup float ot[SG][TM * TN];
+    threadgroup uint tab[fmt<F>::TAB];
+    load_tab<F>(tab, tid, NTH);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int2 tl = tiles[tg.y];
+    const int e = tl.x & 0xFFFF, nsub = tl.x >> 16, row0 = tl.y, n0 = int(tg.x) * NB;
+    device const uchar* E = kArena ? arena_slot(smap[e], W, W1, W2, W3) : W + ulong(e) * a.gu_stride;
+    device const uchar* g0 = E + a.gate_off + ulong(n0) * a.gu_row;
+    device const uchar* u0 = E + a.up_off + ulong(n0) * a.gu_row;
+    constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tX((device half*)XS, dextents<int32_t, 2>(a.n_embd, 1 << 30));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tG(wg + sg * TN * TK, dextents<int32_t, 2>(TK, TN));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tU(wu + sg * TN * TK, dextents<int32_t, 2>(TK, TN));
+    auto tA = tX.template slice<TK, TM>(0, row0);
+#define MM7_DST op.template get_destination_cooperative_tensor<decltype(tA), decltype(tG), float>()
+    auto accg0 = MM7_DST;
+    auto accu0 = MM7_DST;
+    auto accg1 = MM7_DST;
+    auto accu1 = MM7_DST;
+    auto accg2 = MM7_DST;
+    auto accu2 = MM7_DST;
+    auto accg3 = MM7_DST;
+    auto accu3 = MM7_DST;
+#undef MM7_DST
+    for (uint16_t i = 0; i < accg0.get_capacity(); ++i)
+        if (accg0.is_valid_element(i)) {
+            accg0[i] = 0.0f; accu0[i] = 0.0f;
+            if (MS > 1) { accg1[i] = 0.0f; accu1[i] = 0.0f; }
+            if (MS > 2) { accg2[i] = 0.0f; accu2[i] = 0.0f; }
+            if (MS > 3) { accg3[i] = 0.0f; accu3[i] = 0.0f; }
+        }
+    for (int k0 = 0; k0 < int(a.n_embd); k0 += TK) {
+        if (mm_probe != 1) {   // MM_PROBE 1: skip the decode (stale threadgroup contents; wrong values)
+            stage_w<F, NB, TK>(g0, a.gu_row, k0, wg, tab, tid, NTH);
+            stage_w<F, NB, TK>(u0, a.gu_row, k0, wu, tab, tid, NTH);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm_probe == 2) continue;   // MM_PROBE 2: no matrix multiply
+        tA = tX.template slice<TK, TM>(k0, row0);
+        op.run(tA, tG, accg0);
+        op.run(tA, tU, accu0);
+        if (MS > 1 && nsub > 1) {
+            tA = tX.template slice<TK, TM>(k0, row0 + 16);
+            op.run(tA, tG, accg1);
+            op.run(tA, tU, accu1);
+        }
+        if (MS > 2 && nsub > 2) {
+            tA = tX.template slice<TK, TM>(k0, row0 + 32);
+            op.run(tA, tG, accg2);
+            op.run(tA, tU, accu2);
+        }
+        if (MS > 3 && nsub > 3) {
+            tA = tX.template slice<TK, TM>(k0, row0 + 48);
+            op.run(tA, tG, accg3);
+            op.run(tA, tU, accu3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tO(ot[sg], dextents<int32_t, 2>(TN, TM));
+#define MM7_OUT(S, AG, AU) \
+    if (MS > S && nsub > S) { \
+        for (uint16_t i = 0; i < AG.get_capacity(); ++i) \
+            if (AG.is_valid_element(i)) { const float g = AG[i]; AG[i] = g / (1.0f + exp(-g)) * AU[i]; } \
+        simdgroup_barrier(mem_flags::mem_threadgroup); \
+        AG.store(tO); \
+        simdgroup_barrier(mem_flags::mem_threadgroup); \
+        for (int it = lane; it < TM * TN; it += 32) { \
+            const int m = it / TN, f = it - m * TN; \
+            HS[ulong(row0 + S * 16 + m) * a.n_ff + n0 + sg * TN + f] = hsat(ot[sg][it]); \
+        } \
+        simdgroup_barrier(mem_flags::mem_threadgroup); \
+    }
+    MM7_OUT(0, accg0, accu0)
+    MM7_OUT(1, accg1, accu1)
+    MM7_OUT(2, accg2, accu2)
+    MM7_OUT(3, accg3, accu3)
+#undef MM7_OUT
+}
+
+template <int F, int MS, int TN, int TK, int SG>
+kernel void mm_down7(device const uchar* W [[buffer(0)]], device const half* HS [[buffer(1)]],
+                     device float* YE [[buffer(2)]], device const int2* tiles [[buffer(3)]], constant MmArgs& a [[buffer(4)]],
+                     device const uint* smap [[buffer(5)]], device const uchar* W1 [[buffer(6)]],
+                     device const uchar* W2 [[buffer(7)]], device const uchar* W3 [[buffer(8)]],
+                     uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                     ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int TM = 16, NTH = SG * 32, NB = SG * TN;
+    threadgroup half wd[NB * TK];
+    threadgroup uint tab[fmt<F>::TAB];
+    load_tab<F>(tab, tid, NTH);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int2 tl = tiles[tg.y];
+    const int e = tl.x & 0xFFFF, nsub = tl.x >> 16, row0 = tl.y, n0 = int(tg.x) * NB;
+    device const uchar* w0 = (kArena ? arena_slot(smap[e], W, W1, W2, W3) : W + ulong(e) * a.d_stride) + a.down_off +
+                             ulong(n0) * a.d_row;
+    constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tH((device half*)HS, dextents<int32_t, 2>(a.n_ff, 1 << 30));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tW(wd + sg * TN * TK, dextents<int32_t, 2>(TK, TN));
+    auto tA = tH.template slice<TK, TM>(0, row0);
+#define MM7D_DST op.template get_destination_cooperative_tensor<decltype(tA), decltype(tW), float>()
+    auto acc0 = MM7D_DST;
+    auto acc1 = MM7D_DST;
+    auto acc2 = MM7D_DST;
+    auto acc3 = MM7D_DST;
+#undef MM7D_DST
+    for (uint16_t i = 0; i < acc0.get_capacity(); ++i)
+        if (acc0.is_valid_element(i)) {
+            acc0[i] = 0.0f;
+            if (MS > 1) acc1[i] = 0.0f;
+            if (MS > 2) acc2[i] = 0.0f;
+            if (MS > 3) acc3[i] = 0.0f;
+        }
+    for (int k0 = 0; k0 < int(a.n_ff); k0 += TK) {
+        if (mm_probe != 1) stage_w<F, NB, TK>(w0, a.d_row, k0, wd, tab, tid, NTH);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (mm_probe == 2) continue;
+        tA = tH.template slice<TK, TM>(k0, row0);
+        op.run(tA, tW, acc0);
+        if (MS > 1 && nsub > 1) { tA = tH.template slice<TK, TM>(k0, row0 + 16); op.run(tA, tW, acc1); }
+        if (MS > 2 && nsub > 2) { tA = tH.template slice<TK, TM>(k0, row0 + 32); op.run(tA, tW, acc2); }
+        if (MS > 3 && nsub > 3) { tA = tH.template slice<TK, TM>(k0, row0 + 48); op.run(tA, tW, acc3); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tY(YE, dextents<int32_t, 2>(a.n_embd, 1 << 30));
+    acc0.store(tY.slice(n0 + sg * TN, row0));
+    if (MS > 1 && nsub > 1) acc1.store(tY.slice(n0 + sg * TN, row0 + 16));
+    if (MS > 2 && nsub > 2) acc2.store(tY.slice(n0 + sg * TN, row0 + 32));
+    if (MS > 3 && nsub > 3) acc3.store(tY.slice(n0 + sg * TN, row0 + 48));
+}
+
+#define MMGU7_(F, M, N, K, S) template [[host_name("mm_gu7_" #F "_" #M "_" #N "_" #K "_" #S)]] kernel decltype(mm_gu7<F, M, N, K, S>) mm_gu7<F, M, N, K, S>;
+#define MMDN7_(F, M, N, K, S) template [[host_name("mm_down7_" #F "_" #M "_" #N "_" #K "_" #S)]] kernel decltype(mm_down7<F, M, N, K, S>) mm_down7<F, M, N, K, S>;
+#define MM7_GU(F) MMGU7_(F, 4, 16, 32, 4) MMGU7_(F, 4, 16, 32, 2) MMGU7_(F, 4, 16, 32, 1) MMGU7_(F, 4, 32, 32, 2) \
+                  MMGU7_(F, 2, 16, 32, 4) MMGU7_(F, 1, 16, 32, 4) MMGU7_(F, 2, 16, 32, 2) MMGU7_(F, 3, 16, 32, 4)
+#define MM7_DN(F) MMDN7_(F, 4, 32, 32, 4) MMDN7_(F, 4, 32, 32, 2) MMDN7_(F, 4, 32, 32, 1) \
+                  MMDN7_(F, 2, 32, 32, 4) MMDN7_(F, 1, 32, 32, 4) MMDN7_(F, 2, 64, 32, 2)
+MM7_GU(T_IQ3_XXS) MM7_GU(T_IQ2_S) MM7_GU(T_IQ4_XS) MM7_GU(T_IQ2_XXS) MM7_GU(T_IQ2_XS) MM7_GU(T_IQ3_S)
+MM7_GU(T_Q4_K) MM7_GU(T_Q5_K) MM7_GU(T_Q6_K) MM7_GU(T_Q8_0)
+MM7_DN(T_Q5_0) MM7_DN(T_IQ4_NL) MM7_DN(T_Q2_0) MM7_DN(T_Q8_0) MM7_DN(T_Q6_K)
+MM7_DN(T_IQ3_XXS) MM7_DN(T_IQ2_S) MM7_DN(T_IQ4_XS) MM7_DN(T_IQ3_S)
+#ifdef STRATA_KQ_DOWN
+MM7_DN(T_Q4_K) MM7_DN(T_Q5_K) MM7_DN(T_Q3_K)
 #endif

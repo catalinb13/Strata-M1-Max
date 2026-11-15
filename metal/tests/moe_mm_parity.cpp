@@ -34,7 +34,7 @@ float h16(float v) { return ref::f16_to_f32(ref::f32_to_f16(v)); }
 
 int main(int argc, char** argv) {
     int gu = ref::Q2_0, dn = ref::Q2_0, T = 256, TM = 16, TN = 64, TK = 64, SG = 2, DTN = -1, DTK = -1, DSG = -1;
-    bool bench = false, v2 = false, v3 = false, v4 = false, v5 = false, v6 = false, mpp = false;
+    bool bench = false, v2 = false, v3 = false, v4 = false, v5 = false, v6 = false, v7 = false, mpp = false;
     int MS = 1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
         else if (a == "--v3") v2 = v3 = true;   // v2's gather + the register-operand GEMMs (TN per simdgroup)
         else if (a == "--v4") { v2 = v3 = v4 = true; MS = std::atoi(argv[++i]); }   // mm_gu4 with MS 16-row subtiles
         else if (a == "--v6") { v2 = v3 = true; v6 = true; MS = std::atoi(argv[++i]); }   // mm_gu6 / mm_down6 / mm_scan6: groups of MS 16-row subtiles
+        else if (a == "--v7") { v2 = true; v7 = true; MS = std::atoi(argv[++i]); }   // mm_gu7 / mm_down7: v6's groups, the decoded block staged in threadgroup memory (no COOP_K4)
         else if (a == "--v5") { v2 = v3 = true; v5 = true; }   // mm_gu5 (weight blocks staged in threadgroup memory)
     }
     if (bench && T == 256) T = 2048;
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
     // It has no IQ4_XS gate/up, so that type runs the v2 path here instead of failing at the pipeline lookup.
     if (!v2 && gu == ref::IQ4_XS) { v2 = true; std::printf("note: IQ4_XS gate/up has no v1 kernel (the engine does not use v1): running v2\n"); }
     if (v4) TM = 16 * MS;   // the plan's tile height; mm_gu4's name carries MS instead
-    if (v6) TM = 16;   // ragged tiles: the padding is 16 rows, the group size is MS
+    if (v6 || v7) TM = 16;   // ragged tiles: the padding is 16 rows, the group size is MS
     mtl::Context cx;
     // the host defines STRATA_KQ_DOWN only for a model whose downs are K-quant / IQ4_XS / IQ3_S (window.cpp kq_down_prelude)
     const bool kq_dn = dn == ref::Q3_K || dn == ref::Q4_K || dn == ref::Q5_K || dn == ref::Q6_K || dn == ref::IQ3_S || dn == ref::IQ4_XS;
@@ -102,13 +103,13 @@ int main(int argc, char** argv) {
         }
         for (int k = 0; k < TOPK; ++k) w.as<float>()[t * TOPK + k] /= s;
     }
-    mtl::Pipeline phist = cx.pipeline(lib, "mm_hist"), pscan = cx.pipeline(lib, v6 ? "mm_scan6" : "mm_scan"), pplace = cx.pipeline(lib, "mm_place"),
+    mtl::Pipeline phist = cx.pipeline(lib, "mm_hist"), pscan = cx.pipeline(lib, (v6 || v7) ? "mm_scan6" : "mm_scan"), pplace = cx.pipeline(lib, "mm_place"),
                   pclear = cx.pipeline(lib, "mm_clear"), pcomb = cx.pipeline(lib, "mm_combine");
     if (DTN < 0) { DTN = TN; DTK = TK; DSG = SG; }
     if ((dn == ref::IQ4_NL || dn == ref::Q5_0) && DTK < 32) DTK = 32;   // 32-value units (the v2 / v3 down tiles of IQ4_NL / Q5_0 need TK >= 32)
     const std::string tl = std::to_string(TM) + "_" + std::to_string(TN) + "_" + std::to_string(TK) + "_" + std::to_string(SG);
     const std::string dtl = std::to_string(TM) + "_" + std::to_string(DTN) + "_" + std::to_string(DTK) + "_" + std::to_string(DSG);
-    std::string v6_gu, v6_dn;
+    std::string v6_gu, v6_dn, v7_gu, v7_dn;
     mtl::Constants probe;
     probe.i(5, std::getenv("MM_PROBE") ? std::atoi(std::getenv("MM_PROBE")) : 0);
     const bool k4 = coop_k4(cx);
@@ -119,7 +120,14 @@ int main(int argc, char** argv) {
         v6_gu = "mm_gu6_" + std::to_string(gu) + "_" + tl6;
         v6_dn = "mm_down6_" + std::to_string(dn) + "_" + dtl6;
     }
+    if (v7) {   // names carry MS, TN, TK, SG as well; no function constants at all (no COOP_K4 dependence)
+        const std::string tl7 = std::to_string(MS) + "_" + std::to_string(TN) + "_" + std::to_string(TK) + "_" + std::to_string(SG);
+        const std::string dtl7 = std::to_string(MS) + "_" + std::to_string(DTN) + "_" + std::to_string(DTK) + "_" + std::to_string(DSG);
+        v7_gu = "mm_gu7_" + std::to_string(gu) + "_" + tl7;
+        v7_dn = "mm_down7_" + std::to_string(dn) + "_" + dtl7;
+    }
     mtl::Pipeline pgu = mpp ? cx.pipeline(lib, "mm_gu_mpp_" + std::to_string(TM) + "_128_4", probe)
+                      : v7 ? cx.pipeline(lib, v7_gu, probe)
                       : v6 ? cx.pipeline(lib, v6_gu, mtl::Constants().b(7, k4)) : v5 ? cx.pipeline(lib, "mm_gu5_" + std::to_string(gu) + "_" + std::to_string(TN) + "_" + std::to_string(SG),
                                          mtl::Constants().b(7, k4))
                       : v4 ? cx.pipeline(lib, "mm_gu4_" + std::to_string(gu) + "_" + std::to_string(MS) + tl.substr(tl.find('_')),
@@ -127,18 +135,19 @@ int main(int argc, char** argv) {
                       : v3 ? cx.pipeline(lib, "mm_gu3_" + std::to_string(gu) + "_" + tl, mtl::Constants().b(7, k4).i(5, std::getenv("MM_PROBE") ? std::atoi(std::getenv("MM_PROBE")) : 0).b(23, std::getenv("QUANT_CTAB") != nullptr))
                            : cx.pipeline(lib, (v2 ? "mm_gu2_" : "mm_gu_") + std::to_string(gu) + "_" + tl, probe),
                   pdn = mpp ? cx.pipeline(lib, "mm_dn_mpp_" + std::to_string(TM) + "_64_2", probe)
+                       : v7 ? cx.pipeline(lib, v7_dn, probe)
                        : v6 ? cx.pipeline(lib, v6_dn, mtl::Constants().b(7, k4)) : v3 ? cx.pipeline(lib, "mm_down3_" + std::to_string(dn) + "_" + dtl, mtl::Constants().b(7, k4))
                             : cx.pipeline(lib, (v2 ? "mm_down2_" : "mm_down_") + std::to_string(dn) + "_" + (v2 ? dtl : tl)),
                   pgat = cx.pipeline(lib, "mm_gather"),
                   peg = cx.pipeline(lib, mpp ? "mm_expand_" + std::to_string(gu) : "mm_gather", probe),
                   ped = cx.pipeline(lib, mpp ? "mm_expand_" + std::to_string(dn) : "mm_gather", probe);
-    MmPlanArgs pa{(uint32_t)nent, TOPK, (uint32_t)NE, (uint32_t)(v6 ? MS : TM), (uint32_t)nblk};
+    MmPlanArgs pa{(uint32_t)nent, TOPK, (uint32_t)NE, (uint32_t)((v6 || v7) ? MS : TM), (uint32_t)nblk};
     auto encode = [&](int layer, std::vector<mtl::Dispatch>& ds, bool plan, bool gemm) {
         if (plan) {
             const uint32_t nclr = maxrows;
             mtl::Dispatch c; c.p = &pclear; c.args = {mtl::Arg::B(stok), mtl::Arg::V(nclr)}; c.grid[0] = (maxrows + 255) / 256; c.tg[0] = 256; ds.push_back(c);
             mtl::Dispatch h; h.p = &phist; h.args = {mtl::Arg::B(ids), mtl::Arg::B(bcnt), mtl::Arg::V(pa)}; h.grid[0] = nblk; h.tg[0] = 1024; ds.push_back(h);
-            meta.as<uint32_t>()[2] = N_FF / TN;
+            meta.as<uint32_t>()[2] = N_FF / (v7 ? TN * SG : TN);   // v7: a threadgroup is SG x TN columns wide
             mtl::Dispatch sc; sc.p = &pscan; sc.args = {mtl::Arg::B(bcnt), mtl::Arg::B(boff), mtl::Arg::B(eoff), mtl::Arg::B(tiles), mtl::Arg::B(meta), mtl::Arg::V(pa)}; sc.tg[0] = NE; ds.push_back(sc);
             mtl::Dispatch pl; pl.p = &pplace; pl.args = {mtl::Arg::B(ids), mtl::Arg::B(w), mtl::Arg::B(boff), mtl::Arg::B(eoff), mtl::Arg::B(stok), mtl::Arg::B(sw), mtl::Arg::B(pos), mtl::Arg::V(pa)}; pl.grid[0] = nblk; pl.tg[0] = 1024; ds.push_back(pl);
         }
@@ -169,6 +178,15 @@ int main(int argc, char** argv) {
                     d.args = {mtl::Arg::B(HS), mtl::Arg::B(ED), mtl::Arg::B(YE), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
                     d.grid[0] = N_EMBD / 64; d.grid[1] = meta.as<uint32_t>()[0]; d.tg[0] = 64; ds.push_back(d);
                 }
+            } else if (v7) {
+            mtl::Dispatch g; g.p = &pgu;
+            g.args = {mtl::Arg::B(W), mtl::Arg::B(XS), mtl::Arg::B(HS), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
+            for (int q = 5; q < 9; ++q) g.args.push_back(mtl::Arg::B(eoff));   // the arena slots (unused without constant 20)
+            g.grid[0] = N_FF / (TN * SG); g.grid[1] = meta.as<uint32_t>()[0]; g.tg[0] = 32 * SG; ds.push_back(g);
+            mtl::Dispatch d; d.p = &pdn;
+            d.args = {mtl::Arg::B(W), mtl::Arg::B(HS), mtl::Arg::B(YE), mtl::Arg::B(tiles), mtl::Arg::V(ma)};
+            for (int q = 5; q < 9; ++q) d.args.push_back(mtl::Arg::B(eoff));
+            d.grid[0] = N_EMBD / (DTN * DSG); d.grid[1] = meta.as<uint32_t>()[0]; d.tg[0] = 32 * DSG; ds.push_back(d);
             } else {
             mtl::Dispatch g; g.p = &pgu;
             if (v2 || v3) g.args = {mtl::Arg::B(W), mtl::Arg::B(XS), mtl::Arg::B(HS), mtl::Arg::B(tiles), mtl::Arg::V(ma)};

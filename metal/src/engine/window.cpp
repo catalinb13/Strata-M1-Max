@@ -121,6 +121,19 @@ std::string kq_down_prelude(const gguf::File& f) {
 }
 
 namespace geo = strata_metal::geo;   // engine/geo.h: the shape this build is compiled for (kCompiledGeometry); Flash-Next's numbers by default
+
+namespace {
+// v7's tile: a threadgroup covers TN x SG columns of the expert GEMMs (STRATA_METAL_PROMPT_V7_TILE / _DTILE)
+std::pair<int, int> v7_tile_of(const char* env, int dtn, int dsg) {
+    const char* e = std::getenv(env);
+    if (!e || !*e) return std::make_pair(dtn, dsg);
+    int tn = dtn, sg = dsg;
+    std::sscanf(e, "%d_%d", &tn, &sg);
+    return std::make_pair(tn, sg);
+}
+int v7_gu_nb() { const auto t = v7_tile_of("STRATA_METAL_PROMPT_V7_TILE", 16, 4); return t.first * t.second; }
+int v7_dn_nb() { const auto t = v7_tile_of("STRATA_METAL_PROMPT_V7_DTILE", 32, 4); return t.first * t.second; }
+}  // namespace
 constexpr int N = geo::N, HC = geo::HC, LR = geo::LR, NFF = geo::NFF, TOPK = geo::TOPK, NEXP = geo::NEXP, NVOCAB_MAX = 248320;
 constexpr int MAXT = strata::kernels::kWindowMaxT;   // the build's window rows (STRATA_WINDOW_MAX_T; the fixed 8 before the grouped verify)
 constexpr int G_NL = geo::NL, G_QI = geo::QI, G_NGDN = geo::NGDN, G_SS = geo::SS, G_HK = geo::HK, G_HV = geo::HV, G_CONV = geo::CONV,
@@ -4111,7 +4124,7 @@ bool tile_ok(const std::string& s, int tm) {
 struct Window::PromptGemm {
     int MT = 0, QS = 256, TM = 16, maxrows = 0, nblk_max = 0;
     int lib = -1, lgdn = -1, lqsa = -1;
-    bool k4 = false, gu_v3 = false, dn_v3 = false, flash = false, moe_mpp = false;
+    bool k4 = false, gu_v3 = false, dn_v3 = false, flash = false, moe_mpp = false, gu_v7 = false, dn_v7 = false;
     uint32_t ecap = 64;   // mpp: experts per fp16 slab batch (64 measured faster than 128 on the M1 Max: the tile-range early exits cost less)
     mtl::Buffer R, bo, inj[2], xnh, V, loh, mixed, mixh, qkv, z, al, be, ygh, gqn, gkn, gvc, ggb, gkq, go, yg, qfull, kcur, vcur,
         iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta, stok, sw, pos,
@@ -4166,6 +4179,15 @@ bool Window::prompt_gemm_init(std::string& err) {
     p.moe_mpp = eo && std::string(eo) == "mpp";
     if (p.moe_mpp) p.gu_v3 = p.dn_v3 = false;
     if (const char* eb = std::getenv("STRATA_METAL_PROMPT_MOE_BATCH")) p.ecap = (uint32_t) std::max(32, std::atoi(eb));
+    // v7 (mm_gu7 / mm_down7): the fused expert GEMMs - v6's groups of 16-row subtiles, the decoded TK x TN block staged
+    // in threadgroup memory, read straight from the pack with no slab and no COOP_K4 dependence (moe_mm.metal).  Its
+    // plan is mm_scan6's, so p.TM carries the group size in subtiles (4 = up to 64 rows a decode).
+    p.gu_v7 = p.dn_v7 = eg && std::string(eg) == "v7";
+    if (p.gu_v7) {
+        p.gu_v3 = p.dn_v3 = p.moe_mpp = false;
+        if (T("blk.0.ffn_gate_exps.weight").type >= 144) p.gu_v7 = p.dn_v7 = false;   // the trellis experts have the v2 kernels only
+        p.TM = 4;
+    }
     // mpp's row tile: a tile reads its expert's gate/up (and down) slab in full, so an expert that serves n rows
     // pays the slab n / TM times.  A 4096-token chunk gives each expert T * topk / n_expert rows (64 here), which
     // TM 64 reads once; TM 32 halves the old 16's traffic.  Kernels: moe_mm.metal's MMGUM_/MMDNM_ list.
@@ -4186,7 +4208,7 @@ bool Window::prompt_gemm_init(std::string& err) {
     // weights T/TM times instead of T/16); the down tile is cut to the same height. Default suffixes start at 16
     // = the old behaviour; STRATA_METAL_PROMPT_GU2_TILE picks the height (the M1 Max's 32 KB threadgroup memory
     // rules out 64_64_64_*; TN must stay 64: the plan's meta splits N by 64).
-    if (!p.gu_v3 && !p.moe_mpp) {   // mpp's tiles are the fixed 16-row ones
+    if (!p.gu_v3 && !p.moe_mpp && !p.gu_v7) {   // mpp's and v7's tiles are the fixed 16-row ones
         p.TM = std::atoi(gu2_tile((int) T("blk.0.ffn_gate_exps.weight").type).c_str() + 1);
         if (p.TM != 32 && p.TM != 64) p.TM = 16;   // an unusable override falls back to the old tile height
         // a height works only if every layer's gate/up AND down kernels exist at it: mixed-quant (GSQ) GGUFs differ
@@ -4257,7 +4279,7 @@ bool Window::prompt_gemm_init(std::string& err) {
     make();
     pg_ = pg.release();
     std::fprintf(stderr, "strata metal: prompts on the matrix units in chunks of %d (experts %s%s, row tile %d, QSA %s, matmul2d layout %s; "
-                         "%.2f GB of buffers%s)\n", C, p.gu_v3 ? "v3" : "v2", p.moe_mpp ? " mpp" : "", p.TM,
+                         "%.2f GB of buffers%s)\n", C, p.gu_v7 ? "v7" : p.gu_v3 ? "v3" : "v2", p.moe_mpp ? " mpp" : "", p.TM,
                  p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
                  need / 1e9, stream_ ? ", in the expert arena while a prompt runs" : "");
     (void) err;
@@ -4268,8 +4290,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     const double chunk_t0 = now_ms();   // includes the prologue (embedding rows, the PLE gather, the dispatch build)
     in_mtp_ = false;
     PromptGemm& p = *pg_;
-    p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
-    p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : N / 64;
+    p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : p.gu_v7 ? NFF / (v7_gu_nb()) : NFF / 64;
+    p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : p.dn_v7 ? N / (v7_dn_nb()) : N / 64;
     auto TN = [this](const std::string& n) -> const gguf::Tensor& { return this->T(n); };
     if (Tn < 1 || Tn > p.MT) { err = "metal prompt: chunk size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal prompt: the chunk runs past the context"; return false; }
@@ -4344,10 +4366,18 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const int sg = std::atoi(tile.c_str() + tile.rfind('_') + 1);
         const int tm = std::atoi(tile.c_str());
         const int tn = Nn <= 64 ? 32 : std::atoi(tile.c_str() + tile.find('_') + 1);
-        const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_" + std::to_string(sg);
+        // block order (STRATA_METAL_PROMPT_GEMM_ORDER=sw): M on the grid's x, N on its y, so the blocks in flight
+        // share one N column block and its B slice stays in L2 instead of the whole B being walked per row tile
+        static const bool sw = [] {
+            const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM_ORDER");
+            return e && std::string(e) == "sw";
+        }();
+        const std::string fn = std::string("gemm_f16_") + (sw ? "sw_" : "") + std::to_string(tm) + "_" +
+                               std::to_string(tn) + "_" + std::to_string(sg);
         PgGemm g{M, Nn, K, 0};
-        D(PP(p.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn,
-          (M + tm - 1) / tm, (uint32_t) (sg * 32));
+        D(PP(p.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)},
+          sw ? (uint32_t) ((M + tm - 1) / tm) : (uint32_t) ((Nn + tn - 1) / tn),
+          sw ? (uint32_t) ((Nn + tn - 1) / tn) : (uint32_t) ((M + tm - 1) / tm), (uint32_t) (sg * 32));
     };
     auto dqb = [&](const mtl::Buffer& src, size_t off, int type, int n_in, int n_out, const mtl::Buffer& out, size_t out_off = 0,
                    uint32_t perm = 0) {
@@ -4638,8 +4668,8 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const uint32_t nclr = (uint32_t) p.maxrows;
         D(PP(p.lib, "mm_clear"), {mtl::Arg::B(p.stok), mtl::Arg::V(nclr)}, (p.maxrows + 255) / 256, 1, 256);
         D(PP(p.lib, "mm_hist"), {mtl::Arg::B(p.ids), mtl::Arg::B(p.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
-        D(PP(p.lib, "mm_scan"), {mtl::Arg::B(p.bcnt), mtl::Arg::B(p.boff), mtl::Arg::B(p.eoff), mtl::Arg::B(p.tiles),
-                                 mtl::Arg::B(p.meta), mtl::Arg::V(pa)}, 1, 1, nexp_);
+        D(PP(p.lib, p.gu_v7 ? "mm_scan6" : "mm_scan"), {mtl::Arg::B(p.bcnt), mtl::Arg::B(p.boff), mtl::Arg::B(p.eoff),
+                                                         mtl::Arg::B(p.tiles), mtl::Arg::B(p.meta), mtl::Arg::V(pa)}, 1, 1, nexp_);
         D(PP(p.lib, "mm_place"), {mtl::Arg::B(p.ids), mtl::Arg::B(p.wts), mtl::Arg::B(p.boff), mtl::Arg::B(p.eoff),
                                   mtl::Arg::B(p.stok), mtl::Arg::B(p.sw), mtl::Arg::B(p.pos), mtl::Arg::V(pa)}, nblk, 1, 1024);
         PgMm ma{eg.offset, TN(b + "ffn_up_exps.weight").offset, ed.offset, 0, 0, (uint32_t) ref::row_bytes(eg.type, N),
@@ -4701,6 +4731,44 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
                 d2.args = {mtl::Arg::B(p.HS), mtl::Arg::B(p.ED), mtl::Arg::B(p.YE), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
                 d2.tg[0] = 64; d2.indirect = &p.meta; d2.ind_off = 5 * 4; push(ds, d2);
             }
+        } else if (p.gu_v7) {   // the fused expert GEMMs: no slab, no expand, one weight decode a group
+            if (stream_) cuts.push_back((int) ds.size());   // the host's turn: this layer's experts put in place
+            // STRATA_METAL_PROMPT_MM_PROBE=1 skips the weight decode, 2 the matrix multiply (wrong answers; the
+            // expert phase's split, see moe_mm.metal's mm_probe)
+            static const int mmprobe = [] {
+                const char* e = std::getenv("STRATA_METAL_PROMPT_MM_PROBE");
+                return e && *e ? std::atoi(e) : 0;
+            }();
+            mtl::Constants c7;
+            if (stream_) c7.b(20, true);
+            if (mmprobe) c7.i(5, mmprobe);
+            const std::string ak7 = ak + (mmprobe ? "#p" + std::to_string(mmprobe) : "");
+            // tile "<tn>_<sg>" for gate/up and "<tn>_<sg>" for down (STRATA_METAL_PROMPT_V7_TILE, default 16_4 / 32_4):
+            // a threadgroup is SG x TN columns wide and holds 2 x SG x TN x 32 halfs of staged weights, so SG and TN
+            // set how many threadgroups a core can keep in flight while one waits on its weight reads
+            static const std::pair<int, int> t7gu = v7_tile_of("STRATA_METAL_PROMPT_V7_TILE", 16, 4);
+            static const std::pair<int, int> t7dn = v7_tile_of("STRATA_METAL_PROMPT_V7_DTILE", 32, 4);
+            const std::string fgu = "mm_gu7_" + std::to_string(eg.type) + "_4_" + std::to_string(t7gu.first) + "_32_" +
+                                    std::to_string(t7gu.second);
+            const std::string fdn = "mm_down7_" + std::to_string(ed.type) + "_4_" + std::to_string(t7dn.first) + "_32_" +
+                                    std::to_string(t7dn.second);
+            mtl::Dispatch gu;
+            gu.p = PP(p.lib, fgu, c7, fgu + ak7);
+            gu.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(p.XS), mtl::Arg::B(p.HS), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
+            arena_args(gu);
+            gu.tg[0] = 32 * (uint32_t) t7gu.second;
+            gu.indirect = &p.meta;
+            gu.ind_off = 2 * 4;
+            push(ds, gu);
+            if (hd) had_rows_ind(ds, p.lib, "pg:", p.HS, p.meta);
+            mtl::Dispatch dn;
+            dn.p = PP(p.lib, fdn, c7, fdn + ak7);
+            dn.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(p.HS), mtl::Arg::B(p.YE), mtl::Arg::B(p.tiles), mtl::Arg::V(ma)};
+            arena_args(dn);
+            dn.tg[0] = 32 * (uint32_t) t7dn.second;
+            dn.indirect = &p.meta;
+            dn.ind_off = 5 * 4;
+            push(ds, dn);
         } else {
         mtl::Dispatch gu;
         if (p.gu_v3) {

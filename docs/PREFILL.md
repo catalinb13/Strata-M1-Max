@@ -177,3 +177,71 @@ STRATA_PLE_STATS=1
 MMB_ONLY=mpp_mm_  ./build-metal/mm_bench     # 9.6 TFLOP/s fp32-accumulate
 MMB_ONLY=hacc     ./build-metal/mm_bench     # 9.64 TFLOP/s fp16-accumulate
 ```
+
+## The expert path, second try: decode without a slab (v7, `mm_gu7` / `mm_down7`)
+
+The mpp path wins the drive budget by writing each expert to an fp16 slab once and reading it back: at TM 32 a
+5120-row chunk writes 194 GB of slab and reads 388 GB of it back. The kernels that avoid that (v3-v6) decode the
+pack's bytes straight into matmul2d's right-input cooperative tensor, which needs the M5's element layout: runs of 4
+consecutive k at one n, so one fetch feeds four weights. On the M1 the same tensor holds pairs of n at one k, so a
+lane's four values are four different rows, each with its own block header - the trick does not transfer, which is
+why `STRATA_METAL_PROMPT_EXPERTS=v3` is off there.
+
+v7 stages the decoded TK x TN block in **threadgroup memory** instead (as `mm_gu` / `mm_gu2` do) and lets matmul2d
+read it from there, so nothing depends on the layout. It keeps v6's plan (`mm_scan6`): a tile is a group of up to MS
+16-row subtiles of one expert, so the decode is paid once for 64 rows instead of once for 16. Nothing of the expert is
+ever written to device memory: the pack's quantized bytes are the only traffic.
+
+| | |
+|---|---|
+| parity (`moe_mm_parity --v7 4`, IQ3_XXS gate/up + Q5_0 down, 256 tokens) | plan ok, y vs the fp16-operand reference **rel L2 3.16e-05** (the v2/v3/v6 family's 2.6-3.2e-05), same output tokens as mpp end to end |
+| harness, the engine's shape (512 experts, 5120 rows = 100 rows an expert, the pack's six type pairs) | **929-1008 tok/s experts-only** (gate/up 3.9-4.4 TFLOP/s, down 6.2-6.6); mpp in the same harness at 2048 rows: 616 |
+| the engine, a 5120-row chunk (GPU ms of the MoE class) | v7 **11 658**, mpp **6 121**; with the drive faked (`STRATA_METAL_STREAM_FAKE=1`) 9 900 against 4 740 |
+| `STRATA_METAL_PROMPT_MM_PROBE`: the same 12287-token prompt | full 75.1 s, without the decode 69.4 s, without the matrix multiply 36.1 s |
+
+So the fused path is 1.4x faster than the slab path **in isolation** and 1.9x slower **in the engine**, and the probes
+say why it is not the decode: removing the decode buys 5.7 s of a 75 s prompt, removing the MMA 39 s. The slab path
+feeds one dynamic-K matmul from a dense, sequential fp16 buffer that the MMA loop never pauses for; v7 puts a
+barrier and a threadgroup round trip every 32 k in front of the same accumulator registers. On this GPU (5.1 TFLOP/s
+for mpp in the engine against 2.4 for v7) the slab is the cheaper way to keep the matrix units fed, which is the
+opposite of the assumption the v3-v6 kernels were written on and the reason they were gated to the M5.
+
+It stays in the tree as `STRATA_METAL_PROMPT_EXPERTS=v7`, off by default: it is the path for a GPU without the M5's
+layout, it needs no slab space in the arena, and `STRATA_METAL_PROMPT_V7_TILE` sweeps its shape. What it does not do
+is make an M1 Max's prompt faster.
+
+## Where a chunk's GPU time goes, by class (mpp, TM 32, 5120 rows)
+
+The classes are additive differences (`STRATA_METAL_PROMPT_SKIP`), so each is the class plus what depends on it:
+
+| class | ms | share | measured as |
+|---|---|---|---|
+| routed experts (mpp TM 32, slab path) | 6 210 | 44% | chunk 13 907 - `SKIP=moe` 7 694 |
+| GDN layers (36 of the 48) | 3 690 | 26% | chunk - `SKIP=gdn` 10 213 |
+| QSA layers (12) | 3 140 | 22% | chunk - `SKIP=qsa` 10 772 |
+| hc mixes | 1 170 | 8% | chunk - `SKIP=hc` 12 738 |
+
+The attention machinery is now as large as the experts, and both are GEMM-dominated: GDN's fused input projection is
+16 480 x 2 560 a layer and QSA's is 12 288 x 2 560 plus 6 144 x 2 560, so 36 + 12 layers of them are ~10 GFLOP a
+token. At the 9.6 TFLOP/s of the matrix units that is 1.1 ms a token for the two, against the 2.9 ms a token they
+take: they run at 60% of the ceiling, the same place the dense half has been all along.
+
+## The dense projections' block order (`STRATA_METAL_PROMPT_GEMM_ORDER=sw`)
+
+`gemm_f16` tiles Y as TM x TN and the host put N on the grid's x, so Metal (which issues threadgroups x-major) walked
+the whole B matrix once per TM-row tile of A - 80 traversals of every dense projection in a 5120-row chunk. With M on
+x and N on y, the blocks in flight share one N column block: its B slice (TN x K halfs = 320 KB at TN 64) is read
+once and then served from L2, and A (M x K = 26 MB) becomes the operand that repeats - and it fits L2.
+
+| order and tile | chunk GPU ms |
+|---|---|
+| N on x (the old order), 64_64_4 | 13 437 |
+| **M on x (sw), 64_64_4** | **12 990** |
+| sw, 128_64_4 | 14 091 |
+| sw, 64_128_4 | 13 883 |
+| sw, 128_128_4 | 17 908 |
+
+-3.3% and bit-identical output, not the 1.4x the traffic model predicted: at 64-column blocks the B slice was mostly
+L2-served already, so what the projections are short of is MMA issue and accumulator occupancy, not the drive. Taller
+tiles make that worse, which is the same lesson as the fp16-accumulate probe: on this GPU the dense half's remaining
+third is scheduling, not bandwidth.
