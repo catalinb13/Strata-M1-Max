@@ -3234,7 +3234,8 @@ void Window::bind_draft(strata::core::QsaState& st) {
     if (mkq_.empty()) return;
     // the draft layer has no indexer (the snapshot saves no pooled rows for it); its tail/dead ring is not part of the image.
     // It keeps the INT8 layout whatever --kv says: its own qsa_prep/qsa_attn dispatch below is the int8 kernel pair, so an
-    // fp16 flag here would describe a cache the drafter never writes.
+    // fp16 flag here would describe a cache the drafter never writes.  (Measured 2026-11-15: fp16 here bought no
+    // acceptance - 19/29 and 21/27 against 36/44 for int8 - for ~194 MiB more ring at 204,800 cells.)
     bind_qsa(st, mkq_[0], mvq_[0], mksc_[0], mvsc_[0], nullptr, nullptr, nullptr, max_cells_, false);
 }
 
@@ -3496,9 +3497,32 @@ bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, c
 // park/restore: `out` = the window's {k, v, k scale, v scale, pooled} buffers for the QSA layer whose session
 // state is `st`, in the window's [cell][head][unit] order.  The session's own CUDA-shaped pools were given back
 // at startup (stream_arena); these cells are the live K/V a parked conversation saves and rewrites.  A batch
-// slot's state lives in its region.  False for a state this window does not hold (the drafter's ring under
-// --mtp parks no K/V yet).
+// slot's state lives in its region, and so does the drafter's ring under --mtp (bind_draft): the window runs the
+// draft rounds itself and keeps that K/V in its own draft cells, which the snapshot copies like any other layer.
+// False for a state this window does not hold.
 bool Window::kv_pools(const strata::core::QsaState& st, void* out[5], size_t cap[5]) {
+    // The drafter first: mtp_bind_state binds it into the window, and bind_qsa has already given it its cells
+    // (max_cells > 0), so the serve paths describe it as a snapshot part.  Answering false here - as this did -
+    // made every park and every session save of a --mtp run fail with "the Metal window holds no live cells for
+    // this K/V".  It has no indexer pool of its own (index=false: the pooled part is empty), and it keeps the INT8
+    // layout whatever --kv says (bind_draft binds it with f16=false: its own kernels are the int8 pair), so these
+    // are the buffers that binding wrote, scales included.
+    if (g_draft_state != nullptr && &st == g_draft_state) {
+        if (mkq_.empty() || mkq_[0].bytes == 0) {
+            std::fprintf(stderr, "strata metal park: the drafter's state is bound but the window holds no draft cells\n");
+            return false;
+        }
+        out[0] = mkq_[0].ptr;   out[1] = mvq_[0].ptr;
+        out[2] = mksc_[0].ptr;  out[3] = mvsc_[0].ptr;
+        out[4] = nullptr;
+        cap[0] = mkq_[0].bytes;  cap[1] = mvq_[0].bytes;
+        cap[2] = mksc_[0].bytes; cap[3] = mvsc_[0].bytes;
+        cap[4] = 0;
+        if (std::getenv("STRATA_PARK_DEBUG"))
+            std::fprintf(stderr, "strata metal park: draft kq=%p/%zu vq=%p/%zu ksc=%p/%zu vsc=%p/%zu\n",
+                         out[0], cap[0], out[1], cap[1], out[2], cap[2], out[3], cap[3]);
+        return true;
+    }
     if (ss_ && ss_->qsa_states) {
     for (int64_t j = 0; j < ss_->qsa_alloc; ++j)
         if (&ss_->qsa_states[ss_->qsa_ord0 + (size_t) j] == &st) {
@@ -3646,7 +3670,8 @@ bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err)
     };
     XEn_ = act(N); XHn_ = act(N);
     // the draft layer keeps its INT8 cache whatever --kv says (bind_draft binds it as int8: its own qsa_prep/qsa_attn
-    // dispatch below is the int8 kernel pair), so these stay the int8 sizes.
+    // dispatch below is the int8 kernel pair), so these stay the int8 sizes.  (fp16 here was measured to buy no
+    // acceptance for ~194 MiB more ring at 204,800 cells - see bind_draft.)
     mkq_.push_back(A((size_t) MAXC * G_QKV * G_QD)); mvq_.push_back(A((size_t) MAXC * G_QKV * G_QD));
     mksc_.push_back(A(2 * (size_t) MAXC * G_QKV * 4)); mvsc_.push_back(A(2 * (size_t) MAXC * G_QKV * 4));
     mtail_.push_back(A(TAIL_B)); mdead_.push_back(A(DEAD_B)); mpooled_.push_back(A(4 * (size_t) MB * G_ID));

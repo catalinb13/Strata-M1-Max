@@ -1569,19 +1569,25 @@ restore, still required the pooled indexer, so every conversation at least as lo
 16.4 and 14.0 ms, prefill 15.1 s cold and 6.6 s on the two reused turns, no evictions.
 
 From `c84cb517` every serve path asks the drafter whether it owns a K/V ring (`mtp.kv_state().max_cells > 0`)
-before describing its part in a park, a borrow, a restore or a session file. Under `--mtp` on a Mac the decode
-window runs the draft rounds itself and the session-side drafter holds no cells, so those callsites described a
-draft part that does not exist: every park logged `discard invalid snapshot` and the next turn read the whole
-transcript again, a saved file could not be read back (the read reserved a draft part the file never carried),
-and `STRATA_SNAPSHOT_VERIFY` compared the last session part against the all-zero drafter and stopped the engine.
-With the gate the image carries no draft part and the cache round-trips. Measured 2026-10-28 solo on an M1 Max
-(64 GB, UD-Q4_K_XL, `--mtp` with `--spec 2`, 6 slots): a 100,882-token conversation saves to a file in 1112.9 ms
-(1.67 GB), restores at boot in 492.7 ms, and parks of the same size take 323.2 and 141.0 ms; the first
-follow-up reuses 100,724 of 100,772 tokens in 7.4 s against 382.7 s read cold, with the recall needle correct
-after save, park and restart and the restored K/V matching within 2.0e-05 relative L2. What a restored
-conversation loses is only speculation: the window's draft cache starts empty, so the first decodes after a
-restore ran 18-20 tok/s and the next request was back at 20.1; steady greedy probes keep 22.9-23.1 tok/s
-with `--spec 2` (2026-10-27).
+before describing its part in a park, a borrow, a restore or a session file. On a Mac that test is **true**:
+`mtp_bind_state` hands the drafter's `QsaState` to the window, and `bind_qsa` gives it cells (`max_cells > 0`)
+even though the window - not the session - holds the K/V. The callsites therefore describe a draft part, and until
+`Window::kv_pools` resolved the drafter the copy had nowhere to read: every save failed with `conversation
+snapshot: the Metal window holds no live cells for this K/V` and the auto-session file was never written. The
+bridge now answers for the drafter's own cells (`mkq_`/`mvq_`/`mksc_`/`mvsc_`), so a park and a session file carry
+the draft K/V like any other layer's. The drafter's cache stays INT8 whatever `--kv` says (its own kernels are the
+int8 pair): fp16 there was tried and measured on this box - it bought no acceptance (19/29 and 21/27 against 36/44
+for int8) for ~194 MiB more ring at 204,800 cells, so it was reverted.
+Measured 2026-11-15 on an M1 Max (64 GB, UD-IQ4_XS huihui, `--kv fp16`, `--mtp` with `--spec 2`, `--lookup-max-t
+12`, 204,800 context): a 1,919-token conversation saves to a file in 425 ms (288 MB), the whole server restarts and
+reads it back in 100 ms, the next turn reuses 1,920 of 1,938 tokens, a 4,295-token park takes 127.9 ms, and no
+`holds no live cells` line appears in the run. With the drafter in fp16 too: a 1,935-token conversation saved in
+424.7 ms (277 MB) and restored in 102 ms, with acceptance in the int8 band. Earlier, when the bridge did not resolve
+the drafter, every save of an `--mtp` run failed with the error above; and before that, with the gate alone
+(2026-10-28, UD-Q4_K_XL, `--mtp --spec 2`, 6 slots), the image carried no draft part: a 100,882-token conversation
+saved in 1112.9 ms (1.67 GB), restored at boot in 492.7 ms, parks of the same size took 323.2 and 141.0 ms, the
+first follow-up reused 100,724 of 100,772 tokens in 7.4 s against 382.7 s cold, and the restored K/V matched within
+2.0e-05 relative L2.
 A refused K/V byte estimate now names the failing pool and the reason on stderr (`strata: K/V byte estimate
 failed: ...`) - that dump is what traced the 500 on a disk save here to the zero ring.
 
@@ -1775,9 +1781,10 @@ A save never delays a request: it takes the same
 FIFO as a request and only runs when nothing is running or queued, and a file that no longer fits (another model or
 engine version, a half-written file) is refused and the first request simply reads from 0, exactly as without the
 feature. It needs `slot_save_path` (or `--slot-save-path DIR`) and is off with parallel requests (`"parallel"` /
-`--batch`), as slot save/restore is. On the Mac the file holds no draft-model K/V (the decode window keeps that to
-itself): after a restore the first drafts are refused more often than usual until that cache refills - the answer
-stays right, only those few windows decode a little slower.
+`--batch`), as slot save/restore is. On the Mac the file carries the draft layer's K/V too: the decode window runs the
+draft rounds itself and keeps that ring in its own cells (`bind_draft`/`mtp_bind_state`), and the snapshot bridge
+resolves them like any other layer's (`Window::kv_pools`), so a park and a session save take the same bytes the CUDA
+path streams from its host pools.
 
 `--session-save-reclaim` (an engine argument in the config's `args`, off by default) lets a SAVE that fails its
 RAM preflight first release reconstructible host caches: retained K/V buffers, oldest unpinned parked
