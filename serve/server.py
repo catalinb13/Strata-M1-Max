@@ -10299,7 +10299,6 @@ def unfinished_call_text_setting(cfg: dict) -> str:
     return mode
 
 
-
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     """Serve until stopped. For as long as it runs this server holds the shared activity lease of the runtime folder (the same one `strata serve` and
     a runtime host take), so `strata update` and a calibration run see an engine that was started by running this file directly - the desktop app's

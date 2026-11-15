@@ -1911,8 +1911,11 @@ class OutputParser:
                         self.buf = self.buf[:at] + FUNC_START + loose[0] + ">" + after[loose[1]:]
                         continue
                 kind = self._follower(after) if self.recover else None
+                # A block "unfinished_call_text": "drop" holds back is not "returned as text" - it has its own
+                # counter, and one block in two metrics is a report an operator cannot reconcile.
                 if (after.startswith("<") and kind is None and not FUNC_START.startswith(after)
-                        and not after.startswith(FUNC_START)):
+                        and not after.startswith(FUNC_START)
+                        and not (self.drop_unfinished_call_text and self._ok_at(i))):
                     self.unread += 1
                 if kind in ("param", "json"):
                     if i and self.buf[:i].strip():

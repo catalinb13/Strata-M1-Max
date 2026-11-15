@@ -106,8 +106,8 @@ class UnfinishedCallText(unittest.TestCase):
     """`drop_unfinished_call_text`: off by default (the text is the answer, #211), on for these shapes the reply shows no
     call markup - in the answer and in the reasoning, which a client displays - and the parser says what it held back."""
 
-    def events(self, text, drop, step=7, thinking=False):
-        p = OutputParser(thinking=thinking, tools=TOOLS, stream_tools=True)
+    def events(self, text, drop, step=7, thinking=False, recover=False):
+        p = OutputParser(thinking=thinking, tools=TOOLS, stream_tools=True, recover=recover)
         p.drop_unfinished_call_text = drop
         out = []
         for i in range(0, len(text), step):
@@ -115,35 +115,41 @@ class UnfinishedCallText(unittest.TestCase):
         out += p.finish("stop")
         return p, out
 
+    STEPS = (1, 3, 7, 4096)          # every split of a tag gets the same reply: streamed and whole outputs agree
+
+    def each(self, text, drop, thinking=False, recover=False):
+        for step in self.STEPS:
+            yield step, self.events(text, drop, step, thinking, recover)
+
     def reasoning(self, text, drop, tail="\n</think>\n\nDone."):
         return self.events("<think>\n" + text + tail, drop, thinking=True)
 
     def test_the_default_keeps_the_text(self):
         for text in DRIFTED:
-            with self.subTest(text=text[:24]):
-                p, events = self.events(text, drop=False)
-                self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), text.strip())
-                self.assertEqual(p.dropped_unfinished, "")
+            for step, (p, events) in self.each(text, drop=False):
+                with self.subTest(text=text[:24], step=step):
+                    self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), text.strip())
+                    self.assertEqual(p.dropped_unfinished, "")
 
     def test_drop_keeps_the_markup_out_of_the_answer(self):
         for text in DRIFTED:
-            with self.subTest(text=text[:24]):
-                p, events = self.events(text, drop=True)
-                self.assertEqual([e for e in events if e.kind == "content" and e.text.strip()], [])
-                self.assertEqual([e for e in events if e.kind == "tool_call"], [])
-                self.assertEqual(p.dropped_unfinished, text)   # the server logs it
+            for step, (p, events) in self.each(text, drop=True):
+                with self.subTest(text=text[:24], step=step):
+                    self.assertEqual([e for e in events if e.kind == "content" and e.text.strip()], [])
+                    self.assertEqual([e for e in events if e.kind == "tool_call"], [])
+                    self.assertEqual(p.dropped_unfinished, text)   # the server logs it
 
     def test_drop_keeps_the_markup_out_of_the_reasoning(self):
         """The reasoning is what an agent session shows while the model thinks, so the same block there is the same
         leak.  Held back whole, and the answer after `</think>` still arrives."""
         for text in DRIFTED:
-            with self.subTest(text=text[:24]):
-                p, events = self.reasoning(text, drop=True)
-                self.assertEqual([e for e in events if e.kind == "reasoning" and CALL_START in (e.text or "")], [])
-                self.assertEqual([e for e in events if e.kind == "tool_call"], [])
-                self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), "Done.")
-                self.assertEqual(p.dropped_unfinished_blocks, 1)
-                self.assertIn(text.split("\n")[0], p.dropped_unfinished)
+            for step, (p, events) in self.each("<think>\n" + text + "\n</think>\n\nDone.", drop=True, thinking=True):
+                with self.subTest(text=text[:24], step=step):
+                    self.assertEqual([e for e in events if e.kind == "reasoning" and CALL_START in (e.text or "")], [])
+                    self.assertEqual([e for e in events if e.kind == "tool_call"], [])
+                    self.assertEqual("".join(e.text for e in events if e.kind == "content").strip(), "Done.")
+                    self.assertEqual(p.dropped_unfinished_blocks, 1)
+                    self.assertIn(text.split("\n")[0], p.dropped_unfinished)
 
     def test_drop_keeps_a_reasoning_block_the_think_tag_cut_short(self):
         """The thinking ends inside the block (no `</tool_call>`): there is nothing after it to settle it, and with
@@ -151,6 +157,41 @@ class UnfinishedCallText(unittest.TestCase):
         p, events = self.reasoning("<tool_call>\n<functiontodo>\n</function>", drop=True)
         self.assertEqual([e for e in events if e.kind == "reasoning" and CALL_START in (e.text or "")], [])
         self.assertEqual(p.dropped_unfinished_blocks, 1)
+
+    def test_drop_ends_at_the_next_real_call(self):
+        """A held-back block ends where the next real call begins - at its own `</tool_call>` or at the next opener
+        when that closer never came - and that call is still a call."""
+        whole = "<tool_call>\n" + READ + "\n</tool_call>"
+        drift = '<tool_call>\n<functiontodo>\n</function>\n</tool_call>\n'
+        cases = [(drift + whole, drift.rstrip("\n")),          # its own closer ends the block
+                 ('<tool_call>\nitem>\n' + whole, '<tool_call>\nitem>\n')]   # no closer: the next opener ends it
+        for text, want in cases:
+            for step, (p, events) in self.each(text, drop=True):
+                with self.subTest(text=text[:40], step=step):
+                    self.assertEqual([(e.call.name, e.call.arguments) for e in events if e.kind == "tool_call"],
+                                     [("read", {"path": "a.py"})])
+                    self.assertEqual(p.dropped_unfinished, want)
+        for step, (p, events) in self.each("<think>\n" + drift + whole + "\n</think>\n\nDone.",
+                                           drop=True, thinking=True):
+            with self.subTest(reasoning=True, step=step):
+                self.assertEqual([(e.call.name, e.call.arguments) for e in events if e.kind == "tool_call"],
+                                 [("read", {"path": "a.py"})])
+                self.assertEqual(p.dropped_unfinished, drift.rstrip("\n"))
+
+    def test_a_dropped_block_is_counted_once(self):
+        """One block, one metric: with the option off it is text a client sees (the unread counter), with it on it is
+        held back (the dropped counter) and not also reported as returned text."""
+        for text in ("<tool_call>\n<functiontodo>\n</function>\n</tool_call>",
+                     '<tool_call>\n<<parameter name="command">ls\n</parameter>\n</function>\n</tool_call>'):
+            for step, (p, events) in self.each(text, drop=False):
+                with self.subTest(text=text[:24], step=step, drop=False):
+                    self.assertEqual((p.unread, p.dropped_unfinished_blocks), (1, 0))
+            for step, (p, events) in self.each(text, drop=True):
+                with self.subTest(text=text[:24], step=step, drop=True):
+                    self.assertEqual((p.unread, p.dropped_unfinished_blocks), (0, 1))
+            for step in self.STEPS:          # the server parses with recovery on: the same, and no loose-call rewrite
+                p, events = self.events(text, drop=True, step=step, recover=True)
+                self.assertEqual((p.unread, p.dropped_unfinished_blocks), (0, 1))
 
     def test_drop_leaves_a_call_of_the_template_form_alone(self):
         """A body that names its function is not this option's business: a call of an undeclared tool stays text
