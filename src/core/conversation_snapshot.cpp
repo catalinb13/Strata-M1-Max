@@ -375,22 +375,38 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
 #if defined(STRATA_GPU_METAL)
-    (void) src; (void) whole_cells;
+    (void) src;
     void* wp[5]; size_t cap[5];
     if (!window_pools(st, wp, cap)) { error = "conversation snapshot: the Metal window holds no live cells for this K/V"; return false; }
     for (size_t i = 0; i < dst.size(); ++i) {
-        // the cells are the live K/V: repack them into the image's page order, whole range (the
-        // incremental prefix below is CUDA's retained-image path; the window park is a cold copy)
-        dst[i]->resize(sizes[i]);
+        // Incremental park, same rule as the CUDA path below: tokens [0, whole_cells) are pages the previous park
+        // already wrote and the image's page order groups by page, so they occupy the FIRST
+        // `sizes[i] / l.cells * whole_cells` bytes of each part - a contiguous prefix, byte-identical to what a
+        // full pack writes there (a cell is `sizes[i] / l.cells` bytes in the window order too).  The window's
+        // cells at that offset are the same cells, so the repack of [whole_cells, cells) drops straight into the
+        // image at that offset.  Measured (2026-11-16): a whole-range repack at 74-82k tokens copies 2.9 GB per
+        // turn for 427-816 ms, nearly all of it bytes that had not changed.  whole_cells == 0 (the first park of
+        // an image, or a rewritten prompt) leaves the cold copy exactly as it was.
+        const size_t kept_pooled = (size_t) (whole_cells / strata::kernels::qsa_real_shapes().idx_block) *
+                                   (size_t) g.idx_key_dim * sizeof(float);   // whole indexer blocks, block-linear
+        const size_t prefix = i == 4 ? (kept_pooled > sizes[i] ? sizes[i] : kept_pooled)
+                                     : (l.cells ? sizes[i] / (size_t) l.cells : (size_t) 0) * (size_t) whole_cells;
+        // A retained image smaller than the prefix it claims is inconsistent: copy the whole part rather than refuse
+        // the park (a stale image must never cost the conversation its park).
+        const size_t kept = prefix > dst[i]->size() ? 0 : prefix;
+        const int64_t keep_cells = kept != 0 ? whole_cells : 0;   // the fallback copies every cell
+        dst[i]->resize_impl(sizes[i], nullptr);   // not resize(): its zero fill would land on the retained prefix
         if (!sizes[i]) continue;
-        std::vector<uint8_t> scr(sizes[i]);
-        const size_t unit = i == 4 ? 0 : sizes[i] / ((size_t) l.cells * (size_t) g.n_head_kv);
         if (sizes[i] > cap[i]) { error = "conversation snapshot: the Metal window's cells are smaller than the snapshot range"; return false; }
+        std::vector<uint8_t> scr(sizes[i] - kept);
+        const size_t unit = i == 4 ? 0 : sizes[i] / ((size_t) l.cells * (size_t) g.n_head_kv);
         if (std::getenv("STRATA_PARK_DEBUG"))
-            std::fprintf(stderr, "strata metal park: part %zu size %zu cells %lld unit %zu cap %zu\n", i, sizes[i], (long long) l.cells, unit, cap[i]);
-        if (i == 4) std::memcpy(scr.data(), wp[4], sizes[i]);   // indexer pool rows: block-linear in both layouts
-        else window_cells(scr.data(), wp[i], l.cells, l.page_size, g.n_head_kv, unit, true);
-        dst[i]->visit(0, sizes[i], [&](uint8_t* p, size_t n, size_t at) { std::memcpy(p, scr.data() + at, n); return true; });
+            std::fprintf(stderr, "strata metal park: part %zu size %zu prefix %zu tail %zu cells %lld keep %lld unit %zu cap %zu\n",
+                         i, sizes[i], kept, sizes[i] - kept, (long long) l.cells, (long long) whole_cells, unit, cap[i]);
+        if (i == 4) std::memcpy(scr.data(), static_cast<const uint8_t*>(wp[4]) + kept, sizes[i] - kept);   // indexer pool rows: block-linear in both layouts
+        else window_cells(scr.data(), static_cast<const uint8_t*>(wp[i]) + kept, l.cells - keep_cells, l.page_size, g.n_head_kv, unit, true);
+        dst[i]->visit(kept, sizes[i] - kept, [&](uint8_t* p, size_t n, size_t at) { std::memcpy(p, scr.data() + at - kept, n); return true; });
+        if (reused_bytes) *reused_bytes += kept;
     }
     return true;
 #else

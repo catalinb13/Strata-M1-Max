@@ -12410,6 +12410,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
                                      "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
                              (long long) retained_n);
+            if (retained_n > 0 && reuse.kv.empty())
+                std::fprintf(stderr, "strata serve: conversation cache: the %lld tokens of retained K/V are not this "
+                                     "conversation's (nothing reused); capturing the whole conversation\n",
+                             (long long) retained_n);
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -12448,6 +12452,11 @@ int main(int argc, char** argv) {
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
                     reuse, view, src.session, g, draft0, estimate, err)) {
+                // Was silent, and it is the difference between a park that copies the new tail and one that copies the
+                // whole conversation: measured 2026-11-16, every park on this box re-copied 0.3-2.9 GB.  Say which
+                // and why, once per park, so a stale retained image cannot hide behind an unchanged log again.
+                std::fprintf(stderr, "strata serve: conversation cache: the retained K/V is not usable here (%s); "
+                                     "capturing the whole conversation\n", err.c_str());
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
