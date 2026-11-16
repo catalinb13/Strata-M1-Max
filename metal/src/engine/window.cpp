@@ -387,6 +387,9 @@ public:
     }
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
+    // the experts the streaming arena holds resident (arena_used_bytes already leaves out the slots lent to a
+    // prompt's own buffers): what the prompt planner counts as GPU-resident experts
+    uint64_t expert_arena_bytes() const { return st_ && st_->ready() ? st_->arena_used_bytes() : 0; }
     bool streaming() const { return stream_; }
     // --serve's conversation checkpoints: the window's running state (the GDN recurrences and conv histories, the
     // PLE history, each QSA layer's indexer tail and tail-block key); the KV and pooled keys are positional.
@@ -5259,6 +5262,18 @@ bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, co
 }
 bool window_kv_pools(const strata::core::QsaState& st, void* out[5], size_t cap[5]) {
     return g_the_window != nullptr && g_the_window->kv_pools(st, out, cap);
+}
+uint64_t window_expert_arena_bytes() {
+    return g_the_window != nullptr && g_the_window->ready() ? g_the_window->expert_arena_bytes() : 0;
+}
+uint64_t window_stream_arena_budget() {
+    // The prompt plan runs before the stream arena is laid out (the fill needs the chunk the plan picks), so the live
+    // count above reads 0 there.  A configured STRATA_METAL_ARENA_GB is exactly the arena that fill will lay out
+    // (arena_budget.h: an explicit arena_gb wins over every rule), in its decimal GB.
+    const char* e = std::getenv("STRATA_METAL_ARENA_GB");
+    if (e == nullptr || e[0] == '\0') return 0;
+    const double gb = std::atof(e);
+    return gb > 0.0 ? (uint64_t) (gb * 1e9) : 0;
 }
 bool window_init_slots(void* w, const std::vector<strata::core::SessionState*>& slots, std::string& err) {
     return ((Window*) w)->slots_init(slots, err);

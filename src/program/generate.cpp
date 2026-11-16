@@ -169,6 +169,11 @@ bool window_mrope_copy(int slot, bool into_slot, std::string& err);
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
 std::string draft_vocab_default();   // metal/src/engine/window.cpp: the packaged default draft subset (data/draft_vocab.bin)
 bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
+// the experts the streaming arena keeps resident (its lent prompt buffers are already out of this count); the prompt
+// planner treats them as GPU-resident experts, which is what they are
+uint64_t window_expert_arena_bytes();
+// ... and the arena the stream path will lay out, for a plan computed before that fill
+uint64_t window_stream_arena_budget();
 }
 #endif
 
@@ -10195,7 +10200,22 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         uint64_t total = 0;
         for (int64_t l = 0; l < g.n_layers; ++l) total += (uint64_t) lay.blob_bytes(l) * (uint64_t) g.n_expert;
-        if (total == 0 || gpu_cache_bytes >= total) return chunk;   // the GPU holds every expert: no file tier
+        // The Metal streaming arena holds the profile's hottest experts resident (32 GB, 12,469 pairs on the M1 Max),
+        // and `arena_used_bytes` already leaves its lent prompt buffers out: these are experts the GPU holds, exactly
+        // what tier.gpu_cache means.  Without them the plan priced the whole 56 GiB expert set as file tier and printed
+        // "about 385.5 GB read per 32768-token prompt" (measured 2026-11-16: a 1,634-token chunk read ~8.6 GB), a
+        // figure six times what the same run actually did.
+        uint64_t gpu_resident = gpu_cache_bytes;
+#if defined(STRATA_GPU_METAL)
+        // The plan runs before the arena exists, so price the one the stream path will lay out (its configured size),
+        // less the prompt's own buffers: the arena lends those slots while a prompt runs, so they are not residency.
+        uint64_t arena = strata::metal_engine::window_expert_arena_bytes();
+        if (arena == 0) arena = strata::metal_engine::window_stream_arena_budget();
+        const uint64_t prompt_buf = arena != 0
+            ? strata::prefill::Prefill::bytes_needed_owned(g, ss, chunk, srcp != nullptr) : 0;
+        gpu_resident += arena > prompt_buf ? arena - prompt_buf : 0;
+#endif
+        if (total == 0 || gpu_resident >= total) return chunk;   // the GPU holds every expert: no file tier
         const auto hm = strata::core::sample_host_memory();
         if (!hm) return chunk;
         const uint64_t slack = 1200ull << 20;   // MemAvailable overstates what the cache can hold (~1 GiB on the #2824 box)
@@ -10212,9 +10232,9 @@ int main(int argc, char** argv) {
         const uint64_t kept_bytes = (uint64_t) std::max<int64_t>(0, kept_slots) * slot_avg;   // the copy's lend region
         pp::Tier tier;
         tier.experts_total = total;
-        tier.gpu_cache = gpu_cache_bytes;
+        tier.gpu_cache = gpu_resident;
         const uint64_t ram_outside_gpu = ram_copy > kept_bytes ? ram_copy - kept_bytes : 0;
-        tier.file_tier = total > gpu_cache_bytes + ram_outside_gpu ? total - gpu_cache_bytes - ram_outside_gpu : 0;
+        tier.file_tier = total > gpu_resident + ram_outside_gpu ? total - gpu_resident - ram_outside_gpu : 0;
         tier.extra_file = o.ple_gguf.empty() ? 0 : (350ull << 20);   // PLE rows the prompt touches (#2824: ~0.35 GiB)
         const int64_t tokens = tokens_hint > 0 ? tokens_hint
                                                : std::max<int64_t>(chunk, std::min<int64_t>(std::max<int64_t>(o.max_context, 4096), 32768));
@@ -20231,7 +20251,10 @@ int main(int argc, char** argv) {
                              (unsigned long long)src.rotated_exchanges(),
                              (unsigned long long)src.avoided_exchange_copy_bytes());
             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
-            if (srcp == &src) {
+            // Only when this pool actually looked something up: on the Metal streaming path the decode window's arena
+            // serves every expert and this pool sees no lookups, so the line printed all zeros with the same cumulative
+            // figure 742 times in one log (measured 2026-11-16) - it named a tier that did nothing.
+            if (srcp == &src && req_look > 0) {
                 std::fprintf(stderr, "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
                                      "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
