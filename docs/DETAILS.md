@@ -3156,3 +3156,33 @@ that gather dependency chain. Measured and rejected around it:
 What is left is to give the kernel independent work to hide that latency: either software-pipeline the gather (decode
 unit u + LPR while accumulating u) or stage a decoded unit in threadgroup memory once and dot from there (the v7/mpp
 shape at decode sizes). The 13.8x probe is the bound, not a prediction.
+
+### The gate/up kernel's headroom does not reach the model while the experts stream
+
+The tile sweep on the real kernel (`expert_parity --bench --gu IQ4_XS --dn Q5_0 --sweep`, 2026-11-16) finds gates
+that are 2.4x faster in isolation than the shipped default, with parity intact (`rel L2 1.6e-07 PASS`):
+
+| gu tile | gate/up | bandwidth |
+| --- | --- | --- |
+| `32,1,4` (shipped) | 983.7 us | 35.1 GB/s |
+| `16,1,4` | 468.3 us | 278.2 GB/s |
+| `8,1,4` | 414.1 us | 314.6 GB/s |
+| `8,1,2` | 410.9 us | 317.1 GB/s |
+
+`8,2,4`, `16,2,4` and `32,2,4` are the opposite extreme (3.4-3.5 ms, 37 GB/s), so lanes-per-row is the whole story: 8 lanes
+per row gives each lane 10 units of independent gathers to hide the latency (the 13.8x probe above says that is what
+costs) where 32 lanes leave it 2.5.
+
+In the engine it changes nothing, measured twice:
+
+| arm | decode window GPU (random 64-token prompt) | served real text, 3 requests |
+| --- | --- | --- |
+| `32,1,4` / `8,2,4` (shipped) | 62.572, 56.726 ms | 29.4, 30.7, 40.6 tok/s, drafts 88/111 |
+| `8,1,2` / `4,1,4` | 60.724, 64.596 ms | 29.6, 30.8, 41.3 tok/s, drafts 84/115 |
+
+So the gate/up kernel is not on the decode critical path here: with the experts streamed from the arena, a window is
+governed by the expert handshake (the 0.8 ms a miss law) and the dense GEMVs - which is why the dense half's fp16 path
+is the one change that moved it (-6.5%), and why the shipped tiles stay. The 2.4x is real and would pay on a machine
+whose experts are resident, where the window is expert-bound; the pack's formats (IQ3_XXS / IQ4_XS gate+up over Q5_0 /
+IQ4_NL down, two IQ2_S layers) all sit at 31-36 GB/s, so a resident configuration would want the pipelined gate/up or
+`8,1,2` first.
