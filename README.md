@@ -30,8 +30,9 @@
 > [catalinb13/Strata-M1-Max](https://github.com/catalinb13/Strata-M1-Max) is [Niko1221/Strata](https://github.com/Niko1221/Strata)
 > tuned, measured and fixed on a **64 GB Apple M1 Max**, where the engine has to serve a 60-82 GB expert model from a
 > machine that cannot hold it. The download buttons, the desktop app and the Terminal installers below are
-> **upstream's**; this fork is built from source ([docs/MAC.md](docs/MAC.md)). It is 152 commits ahead of upstream
-> `main`, and every measured change is written down (`docs/DETAILS.md` → *Apple silicon: M1 Max (this fork)*).
+> **upstream's**; this fork is built from source ([docs/MAC.md](docs/MAC.md)). It tracks upstream `main` — last merge:
+> upstream 0.2.15 (`c77572806`), engine 0.1.60 — and carries its own engine and serving work on top; every measured
+> change is written down (`docs/DETAILS.md` → *Apple silicon: M1 Max (this fork)*).
 
 ## Fork: what this is and what it does
 
