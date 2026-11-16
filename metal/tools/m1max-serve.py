@@ -47,8 +47,19 @@ ENV = {
     "STRATA_METAL_NFCHECK": "1",       # the non-finite sentinel; costs ~nothing and #879 needs it
     "STRATA_NAN_CKPT_RESUME": "1",     # ... and this is what resumes after it fires
     "STRATA_METAL_F16": "1",
-    # deliberately NOT set: the #879 debug instruments (STRATA_METAL_PROFILE / GDNMAX / LOGPOS). They measured +11-12%
-    # on cold reads when off; STRATA_METAL_GDNMAX is the one this box's old config carried as "0", which reads the same.
+    # the prompt GEMM's block order: M on the grid's x, N on its y, so the blocks in flight share one N column and its
+    # B slice stays in L2 instead of the whole B being walked per row tile (the tuned prompt path this box runs)
+    "STRATA_METAL_PROMPT_GEMM_ORDER": "sw",
+    # accuracy, not speed: the tail-skip drops missed experts every token routes below a rank. The default 7 measured
+    # +16.5% on a 12 GB card but changes the answers, and this box keeps the exact expert set.
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    # Deliberately NOT set, and why:
+    #  - the #879 debug instruments (STRATA_METAL_PROFILE / GDNMAX / LOGPOS): +11-12% on cold reads when off. GDNMAX=0
+    #    reads the same as unset, so a config that carries it as "0" is already there.
+    #  - STRATA_METAL_PROMPT_MOE_TM: the engine's own rule is the measured one (32 rows per expert when the chunk gives
+    #    an expert 24+, 16 otherwise); pinning 32 forces the taller tile on short chunks too.
+    #  - STRATA_METAL_TRACE: it prints a margin line per decode window and scans the vocabulary twice to do it. Fine
+    #    for diagnosis, not part of a fast start; this box's config keeps it on for the log the reports read.
 }
 VALUELESS = {"--mmap-experts"}
 
