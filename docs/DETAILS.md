@@ -3121,3 +3121,38 @@ CUDA card, where it measured +1..3 % prompt speed on a Tesla P100 at 30-60K toke
 Options that change answers (other summation order) are separate and explicit: `STRATA_SELECT_SIMT=1|2` (FP32 tiled block scorer,
 KL 0.01 against the warp scorer per #2071), `STRATA_PA_V2T=1` (v2 prompt attention, #2092/#2146), `STRATA_PF_FUSED=1
 STRATA_PF_FUSED_SM75=1` (fused int8 prompt experts for the Q2_0 pack, #2145; only on a 7.5 card, sm_80+ is unchanged), `STRATA_BF16_TC=1` with `STRATA_XN_F16` (#2091).
+
+## The decode expert gate/up is the ALU bottleneck, and it is latency, not throughput (2026-11-16)
+
+`expert_parity --bench` at the engine's shapes (512 experts, 10 of them per token, 2 tokens) on this M1 Max, per layer:
+
+| pack layer group | gate/up | down |
+| --- | --- | --- |
+| IQ3_XXS + Q5_0 (20 of our 48 layers) | 688.7 us, 36.1 GB/s | 109.4 us, 204.0 GB/s |
+| IQ4_XS + Q5_0 (13) | 983.7 us, 35.1 GB/s | 109.2 us, 204.4 GB/s |
+| IQ3_XXS + IQ4_NL (8) | 693.3 us, 35.8 GB/s | 66.2 us, 275.7 GB/s |
+| IQ4_XS + IQ4_NL (4) | 979.2 us, 35.2 GB/s | 66.0 us, 276.5 GB/s |
+| IQ2_S + Q2_0 (2) | 671.8 us, 31.0 GB/s | 67.3 us, 135.7 GB/s |
+
+The gate/up is 85-92% of an expert layer and runs at ~35 GB/s for every format the pack uses - 11% of the 322.8 GB/s
+measured ceiling - while the down reaches 136-276. A format ladder with a fixed down (Q8_0) isolates the cause:
+gate/up Q8_0 296.6, Q2_0 142.4, IQ3_S 41.6, IQ4_XS 35.5, Q4_K 35.1 GB/s. Q4_K has no codebook (pure arithmetic) and is
+just as slow as IQ4_XS's nibble LUT, so it is not the LUT as such: it is the per-32-weight gather-and-scale chain.
+
+The probe that bounds it: `deq<T_IQ4_XS>` with the codebook index replaced by a constant measures **70.3 us against
+970.8 - 13.8x faster** (the compiler then hoists the gathers out of the loop). So ~93% of the gate/up kernel's time is
+that gather dependency chain. Measured and rejected around it:
+
+* a 64-byte float codebook (16 words, 16 banks) instead of the 256-word byte table: 975.3 against 970.8 us - no change,
+  so it is not bank conflicts but the loads' latency/issue;
+* the low-register variant (`GEMV_PROBE=3`, one row's unit decoded at a time): 127.5 -> 107.6 GB/s on 2560x1280,
+  234.9 -> 206.2 on 2560x10240 - register pressure is not the cause, and `q[NR][UNIT]` reuse is worth more;
+* the MOE_GU / MOE_DN tiles (7 arms): no tile beats 32,1,4 / 4,2,4 for the IQ4_XS pair;
+* the fp16 expert path (see MAC.md): a window of 71.5 / 61.8 ms against 58.2 / 62.0 - no win for IQ4_XS;
+* deeper verify windows to amortise one decode over more tokens: 1.66 -> 1.88 -> 2.23 tokens a window at spec 2 -> 3 -> 4,
+  but the window grew 70.5 -> 85.8 -> 98.0 ms and tok/s fell 21.4 -> 19.1 -> 19.2, because the dense GEMVs scale with
+  the token count linearly.
+
+What is left is to give the kernel independent work to hide that latency: either software-pipeline the gather (decode
+unit u + LPR while accumulating u) or stage a decoded unit in threadgroup memory once and dot from there (the v7/mpp
+shape at decode sizes). The 13.8x probe is the bound, not a prediction.
