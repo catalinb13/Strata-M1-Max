@@ -88,7 +88,14 @@ Measured on **this** box (Apple M1 Max, 64 GB, macOS 27; Unsloth UD-IQ4_XS *huih
 
 ### How it runs here
 
-Source build (`docs/MAC.md`), served by `serve/server.py --engine strata --config <cfg>` with:
+Source build (`docs/MAC.md`), then one command applies the tuning below to a config `metal/setup_mac.py` wrote, and
+serves it (`--apply` writes, a backup lands beside it; `--start` serves):
+
+```sh
+metal/tools/m1max-serve.py --config strata-ud-iq4_xs-huihui.json --apply --start
+```
+
+Under it, `serve/server.py --engine strata --config <cfg>` with:
 
 ```text
 --max-context 204800  --kv fp16  --prefill auto  --mtp <drafter> --spec 2 --suffix-draft 1
