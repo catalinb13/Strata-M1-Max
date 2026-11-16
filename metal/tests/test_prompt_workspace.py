@@ -71,12 +71,17 @@ def main():
 #include "gguf_lite.h"
 #include "ref_quant.h"
 #include "strata/kernels/window_limits.hpp"
+#include "strata/kernels/ngram.hpp"   // NG_HIST: the PLE history the prompt buffers size themselves for
 #include <mach/mach.h>
 #include <array>
 #include <chrono>
 #include <cstdio>
 #include <set>
 #include <vector>
+// upstream moved the engine's shape into engine/geo.h behind strata_metal::geo; window.cpp aliases it as `geo` and the
+// extracted geometry below is written against that alias
+#include "engine/geo.h"
+namespace geo = strata_metal::geo;
 
 @GEOMETRY@
 @CONSTANTS@
@@ -85,8 +90,17 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// upstream factored the prompt-path libraries into strata_metal::MslLib; pc_setup asks for two of them, and this test
+// only cares about its allocations, so the shim hands back empty ones
+struct MslLib { std::vector<std::string> files; std::string prelude; };
+// window.cpp's own helpers the extracted pc_setup still names; the shim's library is empty, so neither matters here
+static std::string kq_down_prelude(const gguf::File&) { return {}; }
+static MslLib lib_prompt(std::string) { return {}; }
 struct Window {
     mtl::Context* cx_;
+    gguf::File f_;   // as in the real Window: the prelude helper takes it by reference
+    MslLib lib_prompt_gdn() const { return {}; }
+    MslLib lib_prompt_qsa() const { return {}; }
     PromptBufs pb_;
     int64_t max_cells_ = 131200;
     bool had_on_ = false;

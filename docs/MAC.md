@@ -3,13 +3,6 @@
 Strata runs on Apple Silicon Macs through its own engine on Metal. This is the same engine as on a PC. The NVIDIA
 kernels are replaced by Metal ones (`metal/`), and the host code and the server are the PC's. There are two ways in:
 
-- **The Strata app (`.dmg`) and the Terminal (`strata launch`).** The Metal engine comes ready-made: the `.dmg` has it
-  inside, and the Terminal fetches it as an engine component. Nothing is built on your Mac and you need no Command Line
-  Tools ([below](#the-desktop-app-and-strata-launch-on-a-mac)). macOS 15 or newer, as for the source build. If macOS says the
-  app is "damaged", see [Troubleshooting](TROUBLESHOOTING.md#the-desktop-app-and-the-terminal); how the builds are signed:
-DeepSeek V4.1-Flash runs on a Mac with 64 GB of memory or more, and reads pictures too: [DEEPSEEK_MAC.md](DEEPSEEK_MAC.md). It has its
-own engine, separate from the Qwen one described on this page.
-
 > **On this page:** [What you need](#what-you-need) · [Install](#install) · [Defaults](#defaults-and-options) ·
 > [Gyro](#gyro-s-and-gyro-m-agentionais-trellis-experts) · [Measured](#measured-m5-max-128-gb) · [Limits](#limits-this-version) ·
 > [Switches](#switches) · [How it works](#how-it-works) · [History](#history--older-measurements)
