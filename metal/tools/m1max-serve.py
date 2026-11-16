@@ -30,9 +30,10 @@ ARGS = {
     "--suffix-draft": "1",
     "--mmap-experts": None,            # present, no value
     "--kv": "fp16",                    # measured faster than int8 on decode here, ~3% slower on prefill
-    # 1024 (2.73 GiB, 1,183 resident experts) is the smallest cache that keeps the decode hit path on, and the best of
-    # 1024 / 2048 / 4096 measured at arena 30 on 2026-11-16 (23.7 / 23.4 / 22.8 tok/s at 23.6K context, prefill flat;
-    # a streamed miss is waited for behind the GPU's work, so removing misses does not shorten a window).
+    # 1024 (2.73 GiB, 1,183 resident experts). Nine arms at arena 30 on 2026-11-16, two contexts: at 23.6K it is flat and
+    # 4096 is worse (25.3 / 23.4 / 22.8 tok/s for 1024 / 2048 / 4096, misses hide behind the GPU there); at 75.4K it is
+    # the best (25.6 against 512's 25.3 and cache-off's 24.8), because long-history routing is diverse enough that the
+    # resident tier removes real waits. The depth the sessions run decides, and that is 1024.
     "--expert-cache": "1024",
     "--conversation-cache-mib": "8192",
     "--conversation-cache-slots": "6",

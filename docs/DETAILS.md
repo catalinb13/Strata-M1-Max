@@ -163,23 +163,31 @@ the default 7 is measured +16.5% on a 12 GB card and changes the answers. `--exp
 chunk 4096 without the instruments off all measured flat or worse. Steady decode is 27-30 tok/s at 12-18K depth and
 24.7 at 111K; the process holds ~50 GB of the 64 GB box (swap steady ~2 GB, macOS and a browser share the rest).
 
-`--expert-cache` is not a decode lever on this box at arena 30 (measured 2026-11-16, engine 0.1.60-metal, UD-IQ4_XS
-huihui, `--kv fp16 --spec 2`, one 23.6K-token real-text prompt per arm and a 200-token greedy continuation, thinking
-off, arms interleaved 1024 / 2048 / 4096 / 1024; the repeat arm agrees within 0.9%, so the ordering is not noise):
+`--expert-cache` is a *depth*-dependent lever, and a small one (measured 2026-11-16, engine 0.1.60-metal, UD-IQ4_XS
+huihui, `--kv fp16 --spec 2`, one real-text prompt per arm, thinking off, greedy continuation; nine arms across two
+contexts, the same-config spread being ~2.5%):
 
-| `--expert-cache` | resident experts | decode | prefill | drafts accepted |
-| ---: | ---: | ---: | ---: | ---: |
-| 1024 (2.73 GiB) | 1,183 | 23.7 / 23.5 tok/s | 324 / 326 tok/s | 80/122, 80/122 |
-| 2048 (5.47 GiB) | 2,371 | 23.4 | 327 | 84/118 |
-| 4096 (10.94 GiB) | 4,781 | 22.8 | 323 | 77/125 |
+| `--expert-cache` | 23.6K context, 400 tokens | 75.4K context, 300 tokens | prefill at 75.4K |
+| ---: | ---: | ---: | ---: |
+| 0 (off) | 26.1 tok/s | 24.8 tok/s | **308 tok/s** |
+| 512 (1.37 GiB, 591 experts) | **26.4** | 25.3 | 284 |
+| 1024 (2.73 GiB, 1,183) | 25.3 | **25.6** | 282 |
+| 2048 (5.47 GiB, 2,371) | 23.4 | - | - |
+| 4096 (10.94 GiB, 4,781) | 22.8 | - | - |
 
-More resident experts buy nothing and cost a little: the three arms carry the same planned footprint (45.5 GB) and the
-same held figure (45.0 GB), so the cache is inside the budget, not beside it - but the 4096 arm decodes 3.4% slower and
-its draft stream differs (the GPU/CPU split rounds differently). The reason is the one the feed-knob arms found: a
-streamed miss is waited for on the host *behind* the GPU's work, so removing misses cannot shorten a window (see the
-0.8 ms/miss law and the cut handshake above). Keep 1024: the smallest cache that keeps the decode hit path on, and the
-least unified memory taken from the arena and the dense half. The 2026-11-07 "4096/38/0.55" pick predates the
-device-flag cut handshake and the read-ahead depth that made the misses overlap; it does not reproduce here.
+The two contexts disagree, and the deeper one is the one this box serves. At 23.6K the cache buys nothing (a streamed
+miss is waited for on the host *behind* the GPU's work, so deleting misses cannot shorten a window) and a larger tier
+only adds its per-window device-side check: 4096 is 3.4% slower. At 75.4K the order is monotonic the other way -
+1024 > 512 > 0 (25.6 / 25.3 / 24.8) - because routing over a long history is diverse enough that the resident tier
+does remove real waits. Prefill goes the opposite way the same way (ec 0 reads 308 tok/s at 75.4K against 282 with
+the cache: the tier's memory is not free to the prompt buffers), but decode dominates these sessions (142 min decode
+against 56 min prefill over five hours), so decode decides.
+
+Keep 1024: best at the depth the sessions run, inside the budget (the arms all held 45.0 GB), and small enough that
+the 2026-11-07 "4096/38/0.55" pick - which predates the device-flag cut handshake and read-ahead 12 that made the
+misses overlap - does not reproduce. The *planned* footprint is not stable across identical starts (45.5 GB on some,
+50.6 GB when the prompt path falls back to its own buffers rather than borrowing the arena), which is worth knowing
+when the OVER THE CAP line looks worse than usual.
 
 The arena is `STRATA_METAL_ARENA_GB=32` with `--leave-share` 0.35 since 2026-11-15 (38 GB with 0.55 above). The
 footprint the engine plans is the *process*, not the arena: 32.0 arena + 15.1 held before it (dense weights, K/V,
