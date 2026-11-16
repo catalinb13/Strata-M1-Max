@@ -5008,6 +5008,8 @@ class Service:
         self.sess_tried_at = 0.0                       # when a save was last ATTEMPTED; a refusal advances it too
         self.sess_saved_at = 0.0                      # when that file last held what the engine holds
         self.sess_saved_tokens = 0                    # how many tokens that file holds: a smaller save never replaces it
+        self.sess_live_tokens = 0                     # how many the engine holds now (the last request's prompt plus
+                                                      # its answer): the idle loop's AUTO_SESSION_GROWTH test
         self.sess_started_at = time.time()            # the engine's current start; a turn before it is not in the file
         self.sess_needs_restore = False               # a new engine start still awaits the file read-back
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -5231,6 +5233,14 @@ class Service:
 
     # ---- automatic session file ("auto_session": true or a file name; off without it) ----
     AUTO_SESSION_QUIET_S = 10.0        # how long the engine must sit idle after a request before it saves
+    # A save rewrites the WHOLE conversation file: measured 3.9 GiB and 5.8 s of FIFO-held I/O at 140k tokens on an
+    # M1 Max, so saving after every request made one that arrived mid-save wait on 35.5 GiB of rewrites in five
+    # hours for a conversation that barely moved. The client (omp) re-sends its whole conversation with
+    # every request, so the file is only the crash aid, never the only copy: at most AUTO_SESSION_MAX_AGE_S of
+    # traffic is lost when the process dies between saves.
+    AUTO_SESSION_GROWTH = 4096         # tokens the conversation must have grown by to be worth another save
+    AUTO_SESSION_MAX_AGE_S = 600.0     # ... or how old the file may get however little grew (a restart must not
+                                       # wait on growth: sess_saved_at is 0 after a start that restored nothing)
 
     def auto_session_setup(self, value) -> None:
         """Turn the automatic session file on: True saves the engine's live conversation to the file
@@ -5260,7 +5270,9 @@ class Service:
                     self.fifo.release()
         threading.Thread(target=self._auto_session_loop, daemon=True).start()
         print(f"[strata] automatic session file on: {value} in {self.slot_save_path} (written "
-              f"{self.AUTO_SESSION_QUIET_S:g} s after a request settles, read back when the engine starts)",
+              f"{self.AUTO_SESSION_QUIET_S:g} s after a request settles and the conversation grew by "
+              f"{self.AUTO_SESSION_GROWTH:,} tokens or the file went {self.AUTO_SESSION_MAX_AGE_S / 60:.0f} min "
+              "old, read back when the engine starts)",
               flush=True)
 
     def auto_session_path(self) -> str:
@@ -5357,7 +5369,15 @@ class Service:
                     continue
                 if (self.last_request_at or self.started_at) <= max(self.sess_saved_at, self.sess_started_at,
                                                                     self.sess_tried_at):
-                    continue                          # nothing new since the file was written, or the engine restarted
+                    continue            # nothing new since the file was written, or the engine restarted
+                # Cadence: see AUTO_SESSION_GROWTH / AUTO_SESSION_MAX_AGE_S above. A save rewrites the whole
+                # conversation (GiB, seconds of the FIFO held), and the client re-sends its conversation every
+                # request anyway, so only worth it once the conversation grew or the file went stale - at most
+                # AUTO_SESSION_MAX_AGE_S of traffic is lost to a crash. sess_saved_at is 0 after an engine start
+                # that restored nothing, so the first save after a restart passes the age test as before.
+                if (self.sess_live_tokens - self.sess_saved_tokens < self.AUTO_SESSION_GROWTH
+                        and time.time() - self.sess_saved_at < self.AUTO_SESSION_MAX_AGE_S):
+                    continue
                 self.auto_session_save("idle")
             except Exception as e:  # noqa: BLE001 - the saver must never stop the server
                 print(f"[strata] auto-session: {e}", flush=True)
@@ -7064,6 +7084,12 @@ class Service:
                                 t["prompt_tokens"] += seen
                                 t["reused"] += last.get("reused") or 0
                                 t["output_tokens"] += n
+                                # The conversation the engine holds when this answer ends, for the auto-session
+                                # cadence: the client re-sends its WHOLE conversation every turn, so this request's
+                                # prompt IS the conversation and `seen + n` is its size (both always known here: the
+                                # totals only settle for a request the engine really ran, #3040's rejected admission
+                                # never reaches this line).
+                                self.sess_live_tokens = seen + n
                                 t["prompt_ms"] += last.get("prompt_ms") or 0.0
                                 t["decode_ms"] += last.get("decode_ms") or 0.0
                                 t["drafts_offered"] += last.get("drafts_offered") or 0
