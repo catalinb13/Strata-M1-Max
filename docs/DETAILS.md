@@ -90,8 +90,13 @@ opt-in: the fp16-slab expert path (`STRATA_METAL_PROMPT_MOE=mpp`, +5-8% warm pp2
 it holds its speed instead of the default path's 170-186 swing) and the packed-row prompt scan
 (`STRATA_METAL_GDN_SCAN=scan_v`, +1-2%). Every decode tile retune measured flat-to-worse (gemv L/S/K classes, MoE
 tile shapes, `GEMV_NR=2`, spec depths 4/6/8): the M5-tuned picks hold on the M1, because M1 decode is
-quant-decode/latency-bound (kernels run 100-130 GB/s against the 367 GB/s streaming ceiling) rather than bandwidth-
-bound. `STRATA_METAL_PROMPT_EXPERTS=v3` must not be used on the M1: it hits the GPU watchdog (the M1's coop
+quant-decode/latency-bound (kernels run 85-152 GB/s against the 322.8 GB/s read ceiling this box actually measures
+with `metal-perf bandwidth` - the 367/400 GB/s figures are the datasheet's) rather than bandwidth-bound.  The decoder
+itself was re-probed on 2026-11-16: `deq<T_IQ4_XS>`'s eight 2-byte payload loads were replaced with two legal 8-byte
+`ushort4` loads (the 136-byte block is only 8-byte aligned, so a 16-byte load is not usable) and it measured 136.5
+against 141.9 GB/s on the 2560x1280 expert gate/up shape - the compiler already vectorises that read.  The codebook
+is a threadgroup `half2` table (`load_tab<T_IQ4_XS>`), not a device array, so the register-LUT variant has nothing
+left to win either. `STRATA_METAL_PROMPT_EXPERTS=v3` must not be used on the M1: it hits the GPU watchdog (the M1's coop
 right-input layout is not k-runs-of-4). Needle recall at 130K with a repeated filler: correct at depths 5%, 75% and
 95% (exact code tokens), missed at 25% and 50% within 24 tokens.
 
