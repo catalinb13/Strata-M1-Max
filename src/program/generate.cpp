@@ -12380,6 +12380,20 @@ int main(int argc, char** argv) {
                              src.ids.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
+            // --conversation-cache-min-tokens gates by absolute size only, and it cannot know what a park would cost:
+            // a client that interleaves 2-7k side requests (a title, a summary) with one long conversation still
+            // spends a slot on each, and make_room() evicts oldest-first, so the long one goes.  Measured 2026-11-16:
+            // 28 evictions in five hours, the 74k-token conversation re-parked every turn while 2049/3195/6395/7035
+            // token side requests took the slots.  A park the cache would evict a conversation at least 4x longer
+            // than itself for waits for a free slot instead: the long conversation is what the cache is for, and a
+            // skipped park costs only the next turn's read of a conversation that short.
+            if (conversations.size() >= conversations.slots() &&
+                conversations.longest_tokens() >= 4 * (int64_t) src.ids.size()) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens; the cache's longest "
+                                     "parked conversation is %lld, so it keeps its slot)\n",
+                             src.ids.size(), (long long) conversations.longest_tokens());
+                return true;
+            }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
