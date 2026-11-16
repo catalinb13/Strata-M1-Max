@@ -1660,6 +1660,10 @@ void Window::moe_block(std::vector<mtl::Dispatch>& ds, int l, const std::string&
             if (gu_e && !tq_) { gl = gu_o[0]; gr = gu_o[1]; gs = gu_o[2]; }
             if (dn_e && !dq2) { dl = dn_o[0]; dr = dn_o[1]; ds_ = dn_o[2]; }
         }
+        // The fp16 expert path stays Q2_0-only and resident-only: on 2026-11-16 it was extended to the streamed IQ4_XS
+        // pair with arena-capable 16 kernels, and measured SLOWER (a decode window 71.5 ms against the fp32 path's 69.5
+        // and the fp16 dense-only path's 60.1): IQ4_XS's decode is a threadgroup-LUT nibble unpack whose arithmetic the
+        // half products do not shorten, unlike Q2_0's.
         const bool m16 = f16_enc_ && !stream_ && tg_.type == ref::Q2_0 && dq2 && !had_gu(l) && !had_dn(l);
         a.gx_gu = NFF / (gs * (32 / gl) * gr);
         a.gx_dn = N / (ds_ * (32 / dl) * dr);
@@ -1695,8 +1699,8 @@ void Window::moe_block(std::vector<mtl::Dispatch>& ds, int l, const std::string&
         if (hg) had_rows(ds, lib_, "d:", XF_.b, 0, XR_, 0, ntok, N, hsx_.handle ? &hsx_ : nullptr, false);   // before the host's turn
         g.args = {mtl::Arg::B(EW, ebase), hg ? mtl::Arg::B(XR_) : mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tg_.type)), mtl::Arg::B(h_),
                   mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4)};
-        if (m16) {   // x from the half plane x * 4^-(i % 4), h also as half
-            g.args[1] = mtl::Arg::B(XF_.b, XF_.x16_bytes() + (size_t) 2 * MAXT * N);
+        if (m16) {   // x from the format's half plane (kind 1 = x * 4^-(i % 4) for Q2_0, 0 = raw for IQ4_XS), h also as half
+            g.args[1] = mtl::Arg::B(XF_.b, XF_.x16_bytes() + (size_t) x16_kind(tg_.type) * 2 * MAXT * N);
             g.args.push_back(mtl::Arg::B(h16_));
         }
         if (stream_)
@@ -2459,7 +2463,10 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
     Cached& cw = wcache_[key];
     rec_ = &cw.qsa;
-    f16_enc_ = metal_f16() && head && !stream_ && !rows_;   // decode windows of one resident sequence: not the prompt's,
+    // The gate used to require a resident model, because the AUTO rule (f16_auto_for) only picks resident IQ3_S / Q2_0
+    // packs.  A streamed pack has its dense weights resident all the same, and the expert fp16 kernels keep their own
+    // Q2_0 gate further down, so a streamed IQ4_XS pack can take the dense GEMVs on the fp16 path (probe, 2026-11-16).
+    f16_enc_ = metal_f16() && head && !rows_;   // decode windows of one resident sequence: not the prompt's,
                                                             // not streaming, not batch slots
     cuts_ = stream_ ? &cw.cuts : nullptr;
     std::vector<mtl::Dispatch>& ds = cw.ds;

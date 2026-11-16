@@ -496,3 +496,33 @@ The code is in `metal/` (the engine's side in `metal/src/engine`, the kernels in
   - the hyper-connections, the GDN state and the QSA attention stay on the GPU;
   - a whole MTP draft round runs in one command buffer.
 - **The PC builds are byte-identical** with this code present. Every shared file's change is behind `STRATA_GPU_METAL` or `__APPLE__`, and the CUDA and HIP objects are compared after each change.
+
+## M1 Max: the fp16 decode path works on a streamed pack too (2026-11-16)
+
+`STRATA_METAL_F16` used to be gated to a *resident* model twice: the auto rule (`f16_auto_for`) refuses a streaming
+pack, and the window set `f16_enc_ = metal_f16() && head && !stream_ && !rows_`. A streamed pack's **dense** weights
+are resident all the same (only the experts live in the arena), so the `!stream_` was dropped and a streamed
+UD-IQ4_XS pack now takes the dense GEMVs on the fp16 path.
+
+Measured here (M1 Max 64 GB, UD-IQ4_XS, streaming, `--spec 2`, the T2 decode window, 96 tokens, interleaved pairs):
+
+| arm | window GPU, 4 runs | mean |
+| --- | --- | --- |
+| fp32 (`STRATA_METAL_F16` unset) | 72.413, 66.657, 62.544, 62.364 ms | 65.99 ms |
+| fp16 dense | 58.239, 62.000, 60.003, 66.421 ms | 61.67 ms |
+
+That is **-6.5% on the window's GPU time** (paired deltas -19.6%, -6.9%, -4.1%, +6.5%: a few percent to about a tenth,
+not the -29% the docs quote for an M1 Max, because that figure covered the routed experts too - a Q2_0 pack). Served
+through `server.py` on the same chat prompt: 30.0 tok/s without, **32.7 tok/s** with (greedy, 80 tokens, warm). The
+output changes slightly, as documented (mean KL 0.009): the answers are coherent and on topic, worded differently.
+
+**The expert side does not follow on IQ4_XS.** The 16-bit expert kernels (`moe_gu16` / `moe_down16`) were extended to
+the IQ4_XS pair with arena bindings (`smap` + `W1..W3`, so a streamed pack can use them) and measured: a window of
+71.5 and 61.8 ms against the dense-only path's 58.2 and 62.0 - no win, so both the instantiations and the gate change
+were reverted. IQ4_XS's decode is a threadgroup-LUT nibble unpack whose arithmetic the half products do not shorten.
+Also measured and closed on this pack: `STRATA_METAL_MOE_GU` / `MOE_DN` tiles (7 arms: `8,1,2` - the K-quants' M1
+winner - is 22% *slower* here; no tile beats the M5 defaults `32,1,4` / `4,2,4`).
+
+So the decode ceiling on this box is not the 322.8 GB/s the memory measures: the expert GEMVs run at 85-152 GB/s, and
+the same 35-40%-of-the-bandwidth-bound that [QUANTS.md](QUANTS.md) reports for every file holds here. What is left is
+per-kernel latency and ALU, and the fp16 products are the one lever that moved it.
