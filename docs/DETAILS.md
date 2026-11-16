@@ -3186,3 +3186,26 @@ is the one change that moved it (-6.5%), and why the shipped tiles stay. The 2.4
 whose experts are resident, where the window is expert-bound; the pack's formats (IQ3_XXS / IQ4_XS gate+up over Q5_0 /
 IQ4_NL down, two IQ2_S layers) all sit at 31-36 GB/s, so a resident configuration would want the pipelined gate/up or
 `8,1,2` first.
+
+### The register-LUT (simd_shuffle) variant is 7.7x slower than the threadgroup table
+
+A proposed decoder change: hold the 16-entry `kvalues_iq4nl` codebook in lanes 0..15 and look each weight up with
+`simd_shuffle` instead of a threadgroup read ("1 ALU cycle, no bank serialization"). Measured with two new probes in
+`alu_bench` (both: 4 random-index lookups an iteration, 8 independent chains, 2560 x 256 groups):
+
+| probe | lookup | throughput |
+| --- | --- | --- |
+| `a_tgload` | threadgroup read, 512-entry table | 964.0 Gops/s |
+| `a_tgload16` | threadgroup read, 16-entry table | **1081.1 Gops/s** |
+| `a_shfl` | `simd_shuffle` of a register-held codebook | **141.0 Gops/s** |
+| `a_devload` | device memory | 132.4 Gops/s |
+| `a_cstload` | constant memory | 133.8 Gops/s |
+
+So the threadgroup read is the fastest lookup this GPU has and a shuffle costs what a device load costs - on Apple7
+`simd_shuffle` has no crossbar to speak of. Constant memory is no better (it serialises on distinct lanes' addresses),
+which is also why the codebook must not live in `constant`.
+
+This also explains the 13.8x "fixed index" probe: the loads themselves run at 1081 Gops/s, so with the index constant
+the compiler hoists them out of the loop and the *dependency chain* disappears - the chain, not the lookup, is the cost.
+The lever is therefore independent work in flight (the `8,1,2` gate/up tile: 2.4x, parity PASS) or software piping, not
+a different lookup primitive.

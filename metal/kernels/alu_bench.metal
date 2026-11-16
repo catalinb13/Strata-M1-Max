@@ -136,6 +136,38 @@ kernel void a_fma32x16(device float* out [[buffer(0)]], constant float& k [[buff
 }
 
 // 8-byte gathers from a 4 KB table in device memory (L1-resident) and in the constant address space
+// the register-LUT idea (STRATA_METAL_F16's codebook): 16 values in lanes 0..15 of the SIMD group, looked up with
+// simd_shuffle instead of a threadgroup read.  Same index pattern and chain count as a_tgload/a_tgload16.
+kernel void a_shfl(device float* out [[buffer(0)]], constant uint& k [[buffer(1)]], uint gid [[thread_position_in_grid]],
+                   ushort lane [[thread_index_in_simdgroup]]) {
+    const uint cb = lane < 16 ? lane * 17u + 1u : 0u;
+    uint u = gid * 2654435761u;
+    uint s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    for (int i = 0; i < ITER; ++i) {
+        s0 += simd_shuffle(cb, ushort((u >> 3) & 15));
+        s1 += simd_shuffle(cb, ushort((u >> 7) & 15));
+        s2 += simd_shuffle(cb, ushort((u >> 11) & 15));
+        s3 += simd_shuffle(cb, ushort((u >> 15) & 15));
+        u += k;
+    }
+    out[gid] = float(s0 + s1 + s2 + s3);
+}
+
+// the same reads from a 16-entry threadgroup table, which is what a 64-byte codebook looks like
+kernel void a_tgload16(device float* out [[buffer(0)]], constant uint& k [[buffer(1)]], uint gid [[thread_position_in_grid]],
+                       ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint tab[16];
+    for (int i = tid; i < 16; i += 256) tab[i] = i * 17u + 1u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint u = gid * 2654435761u;
+    uint s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    for (int i = 0; i < ITER; ++i) {
+        s0 += tab[(u >> 3) & 15]; s1 += tab[(u >> 7) & 15]; s2 += tab[(u >> 11) & 15]; s3 += tab[(u >> 15) & 15];
+        u += k;
+    }
+    out[gid] = float(s0 + s1 + s2 + s3);
+}
+
 kernel void a_devload(device float* out [[buffer(0)]], constant uint& k [[buffer(1)]], device const uint2* tab [[buffer(2)]],
                       uint gid [[thread_position_in_grid]]) {
     uint u = gid * 2654435761u;

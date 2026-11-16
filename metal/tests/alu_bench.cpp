@@ -13,7 +13,7 @@ int main() {
     for (int i = 0; i < 1024; ++i) tab.as<uint32_t>()[i] = i * 7;
     struct K { const char* name; double ops_per_iter; } ks[] = {
         {"a_fma32", 8}, {"a_fma16", 8}, {"a_fmamix", 8}, {"a_iand", 16}, {"a_shift", 16}, {"a_cvt", 16},
-        {"a_tgload", 4}, {"a_sel", 8}, {"a_dot32", 8}, {"a_dot16", 8}, {"a_dotmix", 8}, {"a_fma32x16", 8}, {"a_devload", 4}, {"a_cstload", 4}, {"a_tgload4", 4}, {"a_popc", 4}};
+        {"a_tgload", 4}, {"a_sel", 8}, {"a_dot32", 8}, {"a_dot16", 8}, {"a_dotmix", 8}, {"a_fma32x16", 8}, {"a_devload", 4}, {"a_cstload", 4}, {"a_tgload4", 4}, {"a_popc", 4}, {"a_shfl", 4}, {"a_tgload16", 4}};
     std::printf("device %s\n", cx.device_name().c_str());
     for (const K& k : ks) {
         mtl::Pipeline p = cx.pipeline(lib, k.name);
